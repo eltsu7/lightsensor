@@ -16,7 +16,7 @@ DEFAULT_GAIN = 1  # ±4.096V
 
 # OPA323 output saturates ~34 mV below the 3.3 V supply rail (measured).
 # In absolute scale (value * gain_voltage) this equals ~326.6.
-SATURATION_VOLTAGE = 3.266  # V
+SATURATION_VOLTAGE = 3.2  # V
 
 
 @dataclass
