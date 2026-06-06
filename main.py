@@ -213,7 +213,16 @@ class SensorApp:
             controls,
             text="Auto Y-scale",
             variable=self.autoscale_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        self.ymin_var = tk.StringVar(value="0")
+        self.ymax_var = tk.StringVar(value="4")
+        self._ymin_entry = ttk.Entry(controls, width=5, textvariable=self.ymin_var)
+        self._ymin_entry.pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(controls, text="–").pack(side=tk.LEFT)
+        self._ymax_entry = ttk.Entry(controls, width=5, textvariable=self.ymax_var)
+        self._ymax_entry.pack(side=tk.LEFT, padx=(2, 16))
+        self.autoscale_var.trace_add("write", lambda *_: self._update_yrange_state())
+        self._update_yrange_state()
 
         self.avg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -308,6 +317,11 @@ class SensorApp:
         NavigationToolbar2Tk(self.canvas, root)  # pan/zoom/save toolbar
 
         self._schedule_redraw()
+
+    def _update_yrange_state(self):
+        state = tk.DISABLED if self.autoscale_var.get() else tk.NORMAL
+        self._ymin_entry.config(state=state)
+        self._ymax_entry.config(state=state)
 
     def _toggle_run(self):
         if self.sampler.acquiring:
@@ -460,10 +474,15 @@ class SensorApp:
             if self.autoscale_var.get():
                 window = list(wv) if wv.size else values
                 lo, hi = min(window), max(window)
-                pad = max(1.0, (hi - lo) * 0.1)
+                # Pad by 10% of the visible range, but at least 0.1% of the
+                # signal magnitude so a stable signal still has breathing room.
+                pad = max((hi - lo) * 0.1, abs((hi + lo) / 2) * 0.001, 1e-6)
                 self.ax.set_ylim(lo - pad, hi + pad)
             else:
-                self.ax.set_ylim(0, 100)
+                try:
+                    self.ax.set_ylim(float(self.ymin_var.get()), float(self.ymax_var.get()))
+                except ValueError:
+                    pass  # keep current limits if input is invalid
 
         self.canvas.draw_idle()
 
