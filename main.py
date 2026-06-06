@@ -292,23 +292,19 @@ class SensorApp:
     def _redraw(self):
         times, values = self.sampler.snapshot()
 
+        gain_v = GAIN_VOLTAGES[self.sampler.current_gain]
         if self.absscale_var.get():
-            scale = GAIN_VOLTAGES[self.sampler.current_gain]
-            values = [v * scale for v in values]
-            self.ax.set_ylabel("Light (abs.)")
+            values = [v * gain_v / 100 for v in values]
+            unit, vfmt, rfmt = "V", ".4f", ".6f"
+            sat_threshold = SATURATION_VOLTAGE
+            self.ax.set_ylabel("Light (V)")
         else:
+            unit, vfmt, rfmt = "%", ".2f", ".4f"
+            sat_threshold = SATURATION_VOLTAGE / gain_v * 100
             self.ax.set_ylabel("Light (%)")
 
         self.line.set_data(times, values)
-
-        # Saturation threshold in the current scale.
-        gain_v = GAIN_VOLTAGES[self.sampler.current_gain]
-        if self.absscale_var.get():
-            sat_threshold = SATURATION_VOLTAGE * 100
-        else:
-            sat_threshold = SATURATION_VOLTAGE / gain_v * 100
         self.sat_line.set_ydata([sat_threshold, sat_threshold])
-
         sensor_sat = self.sampler.sensor_saturated
         adc_sat = self.sampler.adc_saturated
         status = self.sampler.status
@@ -338,7 +334,7 @@ class SensorApp:
             if self.avg_var.get() and wv.size:
                 mean = wv.mean()
                 self.avg_line.set_data([xmin, xmax], [mean, mean])
-                self.avg_line.set_label(f"average = {mean:.2f} %")
+                self.avg_line.set_label(f"average = {mean:{vfmt}} {unit}")
                 legend_handles.append(self.avg_line)
             else:
                 self.avg_line.set_data([], [])
@@ -356,7 +352,7 @@ class SensorApp:
                 )
                 legend_handles.append(Patch(
                     facecolor="tab:red", alpha=0.4,
-                    label=f"σ = {std:.4f} %  ({rel:.2f} %)  p-p = {ptp:.4f} %",
+                    label=f"σ = {std:{rfmt}} {unit}  ({rel:.2f} %)  p-p = {ptp:{rfmt}} {unit}",
                 ))
 
             if self.fit_var.get() and wv.size >= 2 and np.ptp(wt) > 0:
@@ -365,7 +361,7 @@ class SensorApp:
                     [xmin, xmax], [slope * xmin + intercept, slope * xmax + intercept]
                 )
                 self.fit_line.set_label(
-                    f"fit: {slope:+.3f} %/s, intercept {intercept:.2f} %"
+                    f"fit: {slope:+{rfmt}} {unit}/s, intercept {intercept:{vfmt}} {unit}"
                 )
                 legend_handles.append(self.fit_line)
             else:
