@@ -19,6 +19,20 @@ DEFAULT_GAIN = 1  # ±4.096V
 SATURATION_VOLTAGE = 3.2  # V
 
 
+def best_gain(max_voltage, headroom=0.85):
+    """Return the highest gain index that won't saturate for the given peak voltage.
+
+    Iterates from highest gain (±0.256 V) to lowest (±6.144 V) and returns
+    the first index where max_voltage fits below the saturation threshold
+    with the given headroom factor.
+    """
+    for g in range(len(GAIN_VOLTAGES) - 1, -1, -1):
+        threshold = min(SATURATION_VOLTAGE, GAIN_VOLTAGES[g]) * headroom
+        if max_voltage < threshold:
+            return g
+    return 0  # fall back to lowest gain (widest range)
+
+
 @dataclass
 class Reading:
     value: float      # light level, % of ADC full-scale (0–100)
@@ -64,6 +78,13 @@ class LightSensor:
         self.port = port or autodetect_port()
         self.baud = baud
         self.ser = None
+        self.gain = DEFAULT_GAIN  # locally tracked; updated by set_gain()
+        # Continuous autogain: when True, read() manages gain automatically.
+        self.autogain = False
+        self.autogain_interval = 0.25  # seconds between gain evaluations
+        self.autogain_window = 0.5    # seconds of history to consider
+        self._autogain_history: list = []  # (timestamp, voltage_V) pairs
+        self._autogain_last_check = 0.0
         self.open()
 
     def open(self):
@@ -110,7 +131,44 @@ class LightSensor:
             raw, sensor_sat, adc_sat = int(parts[0]), bool(int(parts[1])), bool(int(parts[2]))
         except ValueError:
             return None
-        return Reading(raw / 32767 * 100, sensor_sat, adc_sat)
+        reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
+        if self.autogain:
+            self._autogain_update(reading)
+        return reading
+
+    def _autogain_update(self, reading):
+        now = time.monotonic()
+        voltage = reading.value * GAIN_VOLTAGES[self.gain] / 100
+        self._autogain_history.append((now, voltage))
+        cutoff = now - self.autogain_window
+        self._autogain_history = [(t, v) for t, v in self._autogain_history if t > cutoff]
+        if now - self._autogain_last_check >= self.autogain_interval:
+            self._autogain_last_check = now
+            if self._autogain_history:
+                new_gain = best_gain(max(v for _, v in self._autogain_history))
+                if new_gain != self.gain:
+                    self._autogain_history.clear()
+                    self.set_gain(new_gain)
+
+    def autogain_oneshot(self, n=100):
+        """Collect n samples, find the best gain, apply it, and return the gain index.
+
+        Temporarily disables continuous autogain during the measurement so the
+        gain stays fixed for the full sample set.
+        """
+        was_autogain = self.autogain
+        self.autogain = False
+        try:
+            voltages = []
+            for _ in range(n):
+                r = self.read()
+                if r is not None:
+                    voltages.append(r.value * GAIN_VOLTAGES[self.gain] / 100)
+            if voltages:
+                self.set_gain(best_gain(max(voltages)))
+        finally:
+            self.autogain = was_autogain
+        return self.gain
 
     def set_gain(self, gain_index):
         """Set ADC gain. gain_index 0–5 maps to ±6.144V … ±0.256V. Returns True on success."""
@@ -118,7 +176,10 @@ class LightSensor:
             self.open()
         self.ser.write(f"g{gain_index}".encode())
         resp = self.ser.readline().decode(errors="ignore").strip()
-        return resp == "ok"
+        if resp == "ok":
+            self.gain = gain_index
+            return True
+        return False
 
     def get_gain(self):
         """Return current gain index (0–5), or None on failure."""

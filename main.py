@@ -15,7 +15,7 @@ from matplotlib.backends.backend_tkagg import (
 from matplotlib.figure import Figure
 
 from lightsensor import (
-    LightSensor, Reading, autodetect_port,
+    LightSensor, Reading, autodetect_port, best_gain,
     GAIN_LABELS, GAIN_VOLTAGES, DEFAULT_GAIN, SATURATION_VOLTAGE,
 )
 
@@ -40,6 +40,9 @@ class SensorSampler:
         self._skip_next = False  # discard one sample after a gain change
         self._sensor_sat = False
         self._adc_sat = False
+        self._autogain_continuous = False
+        self._oneshot_n = 0
+        self._oneshot_collected = 0
         self._times = deque(maxlen=MAX_POINTS)
         self._values = deque(maxlen=MAX_POINTS)
         self._running = threading.Event()
@@ -65,9 +68,33 @@ class SensorSampler:
         return self._acquiring.is_set()
 
     def set_gain(self, gain_index):
-        """Request a gain change; applied by the sampler thread on its next loop."""
+        """Request a manual gain change; also stops continuous autogain."""
+        self._autogain_continuous = False
         self._desired_gain = gain_index
         self._skip_next = True
+
+    def start_oneshot_autogain(self, n=100):
+        """Trigger a one-shot autogain measurement in the sampler thread."""
+        self.clear()
+        self._oneshot_collected = 0
+        self._oneshot_n = n
+
+    def enable_autogain(self):
+        self._autogain_continuous = True
+
+    def disable_autogain(self):
+        self._autogain_continuous = False
+
+    @property
+    def autogain_continuous(self):
+        return self._autogain_continuous
+
+    @property
+    def oneshot_progress(self):
+        """(collected, target) while active, else None."""
+        if self._oneshot_n == 0:
+            return None
+        return (self._oneshot_collected, self._oneshot_n)
 
     def clear(self):
         with self._lock:
@@ -95,17 +122,39 @@ class SensorSampler:
                 if self._desired_gain != self._applied_gain:
                     if sensor.set_gain(self._desired_gain):
                         self._applied_gain = self._desired_gain
+                sensor.autogain = self._autogain_continuous
                 reading = sensor.read()
                 if self._skip_next:
                     self._skip_next = False
                     continue
+                # Detect gain change driven by autogain inside read().
+                if sensor.gain != self._applied_gain:
+                    self._applied_gain = sensor.gain
+                    self._desired_gain = sensor.gain
+                    self._skip_next = True
+                    continue
                 if reading is None:
                     value = last_value
                 else:
-                    value = reading.value
+                    # Store as actual voltage (V) so data is gain-independent.
+                    value = reading.value * GAIN_VOLTAGES[self._applied_gain] / 100
                     last_value = value
                     self._sensor_sat = reading.sensor_sat
                     self._adc_sat = reading.adc_sat
+                    # One-shot autogain: count samples, evaluate when target reached.
+                    if self._oneshot_n > 0:
+                        self._oneshot_collected += 1
+                        if self._oneshot_collected >= self._oneshot_n:
+                            with self._lock:
+                                vs = list(self._values)
+                            vs.append(value)
+                            new_gain = best_gain(max(vs))  # vs already in V
+                            self._oneshot_n = 0
+                            if new_gain != self._applied_gain:
+                                sensor.set_gain(new_gain)
+                                self._desired_gain = new_gain
+                                self._applied_gain = new_gain
+                                self._skip_next = True
             except (serial.SerialException, OSError) as exc:
                 # Transient link error: drop the connection and retry.
                 self.status = f"reconnecting ({exc.__class__.__name__})"
@@ -187,7 +236,8 @@ class SensorApp:
             variable=self.noise_var,
         ).pack(side=tk.LEFT, padx=(0, 16))
 
-        self.absscale_var = tk.BooleanVar(value=False)
+        self.absscale_var = tk.BooleanVar(value=True)
+        self.absscale_var.trace_add("write", lambda *_: self.sampler.clear())
         ttk.Checkbutton(
             controls,
             text="Absolute scale",
@@ -207,6 +257,12 @@ class SensorApp:
         gain_combo.pack(side=tk.LEFT, padx=2)
         gain_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_gain())
         ttk.Button(controls, text="+", width=2, command=self._gain_up).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Separator(controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self._oneshot_btn = ttk.Button(controls, text="One-shot gain", command=self._oneshot_autogain)
+        self._oneshot_btn.pack(side=tk.LEFT, padx=(0, 4))
+        self._autogain_btn = ttk.Button(controls, text="Auto gain", command=self._toggle_autogain)
+        self._autogain_btn.pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Label(controls, text="Scan interval (ms):").pack(side=tk.LEFT)
         self.interval_var = tk.StringVar(value=str(int(sampler.interval_s * 1000)))
@@ -263,20 +319,32 @@ class SensorApp:
 
     def _apply_gain(self):
         gain_index = GAIN_LABELS.index(self.gain_var.get())
-        self.sampler.set_gain(gain_index)
-        self.sampler.clear()
+        self.sampler.set_gain(gain_index)  # also disables continuous autogain
+        self._autogain_btn.config(text="Auto gain")
 
     def _gain_up(self):
         idx = GAIN_LABELS.index(self.gain_var.get())
         if idx < len(GAIN_LABELS) - 1:
             self.gain_var.set(GAIN_LABELS[idx + 1])
-            self._apply_gain()
+            self._apply_gain()  # _apply_gain already resets autogain button
 
     def _gain_down(self):
         idx = GAIN_LABELS.index(self.gain_var.get())
         if idx > 0:
             self.gain_var.set(GAIN_LABELS[idx - 1])
             self._apply_gain()  # scale changed; old samples no longer comparable
+
+    def _oneshot_autogain(self):
+        self._oneshot_btn.config(state=tk.DISABLED)
+        self.sampler.start_oneshot_autogain(100)
+
+    def _toggle_autogain(self):
+        if self.sampler.autogain_continuous:
+            self.sampler.disable_autogain()
+            self._autogain_btn.config(text="Auto gain")
+        else:
+            self.sampler.enable_autogain()
+            self._autogain_btn.config(text="Auto gain ●")
 
     def _apply_interval(self):
         try:
@@ -294,17 +362,34 @@ class SensorApp:
 
         gain_v = GAIN_VOLTAGES[self.sampler.current_gain]
         if self.absscale_var.get():
-            values = [v * gain_v / 100 for v in values]
+            # Values already stored as V — use directly.
             unit, vfmt, rfmt = "V", ".4f", ".6f"
             sat_threshold = SATURATION_VOLTAGE
             self.ax.set_ylabel("Light (V)")
         else:
+            # Convert stored V back to % relative to current gain.
+            values = [v / gain_v * 100 for v in values]
             unit, vfmt, rfmt = "%", ".2f", ".4f"
             sat_threshold = SATURATION_VOLTAGE / gain_v * 100
             self.ax.set_ylabel("Light (%)")
 
         self.line.set_data(times, values)
         self.sat_line.set_ydata([sat_threshold, sat_threshold])
+        # Sync gain combobox with whatever gain is currently active
+        # (may have been changed by autogain).
+        current_label = GAIN_LABELS[self.sampler.current_gain]
+        if self.gain_var.get() != current_label:
+            self.gain_var.set(current_label)
+
+        # One-shot progress / completion.
+        progress = self.sampler.oneshot_progress
+        if progress is not None:
+            collected, target = progress
+            self.status_var.set(f"Auto-gain: {collected}/{target}")
+            return
+        else:
+            self._oneshot_btn.config(state=tk.NORMAL)
+
         sensor_sat = self.sampler.sensor_saturated
         adc_sat = self.sampler.adc_saturated
         status = self.sampler.status
