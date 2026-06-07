@@ -5,7 +5,7 @@ Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1
 
 ## Hardware
 - **MCU:** ESP8266 (NodeMCU v2)
-- **ADC:** ADS1115 — connected via I2C (SDA→D2, SCL→D1, ADDR→GND, VDD→3.3V)
+- **ADC:** ADS1115 — connected via I2C (SDA→D2, SCL→D1, ADDR→GND, VDD→3.3V). Currently a Soldered 333095 ADS1115 breakout (datasheet in `docs/`). Runs at 100 kHz I2C and 860 SPS data rate. 400 kHz I2C failed (all zeros) with the breakout's pull-ups over jumper wires.
 - **Sensor:** Custom PCB using OPA323 op-amp, powered from 3.3V
 - **OPA323 saturation:** ~3.266V (~34 mV below 3.3V rail); both sensor and ADC saturation reported per reading
 - **ADC absolute max input:** VDD + 0.3V = 3.6V — do not exceed regardless of gain setting
@@ -16,8 +16,10 @@ Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1
 | `lightsensor/lightsensor.ino` | Arduino sketch — device interface over serial |
 | `lightsensor.py` | Sensor driver — `LightSensor` class, `Reading` dataclass, `best_gain()`, autogain |
 | `main.py` | Debug GUI — Tkinter, threaded sampler, live plot |
+| `test_read.py` | Smoke test — auto-connect, read 10 samples, print values + sample rate |
 | `justfile` | `just compile`, `just upload`, `just flash` |
-| `docs/` | ADS1115, OPA323, ESP8266 datasheets |
+| `docs/` | ADS1115, OPA323, ESP8266, Soldered 333095 breakout datasheets |
+| `TODO_v2.md` | Plans for v2 (ESP32-C3 SuperMini, on-board ADC, new cable) |
 
 ## Usage
 
@@ -84,7 +86,7 @@ Sensor and ADC saturation are mutually exclusive with this hardware: sensor_sat 
 
 ## Device Interface (Serial)
 
-Commands sent over serial at 9600 baud:
+Commands sent over serial at 115200 baud:
 
 | Command | Description | Response |
 |---------|-------------|----------|
@@ -108,22 +110,37 @@ Commands sent over serial at 9600 baud:
 
 Threaded sampler reads as fast as the device allows (decoupled from ~33 fps display). Values are stored as actual voltage (V) so data is gain-independent and preserved across gain changes.
 
-### Controls
+Controls are arranged in a right-hand sidebar grouped into sections.
+
+### View
 | Control | Description |
 |---------|-------------|
-| Auto Y-scale | Autoscale Y axis to visible window |
+| Follow latest | X axis follows the newest points; auto-disabled when the user pans/zooms in time |
+| Auto Y-scale | Autoscale Y axis to visible window; auto-disabled when the user zooms the Y axis |
+| Absolute scale | Y axis in V (default); unchecked shows % of current gain range |
+
+### Overlays
+| Control | Description |
+|---------|-------------|
 | Window average | Dashed line at mean of visible window |
 | Line fit | Linear regression over visible window |
 | Noise band | ±σ shaded band; legend shows σ, relative σ, peak-to-peak |
-| Absolute scale | Y axis in V (default); unchecked shows % of current gain range |
+
+### Gain
+| Control | Description |
+|---------|-------------|
 | Gain − / combobox / + | Manual gain selection; stops continuous autogain |
 | One-shot gain | Collect 100 samples, apply best gain |
 | Auto gain ● | Continuous autogain; ● indicates active |
+
+### Acquisition
+| Control | Description |
+|---------|-------------|
 | Scan interval | Target ms between samples (0 = as fast as possible) |
-| Stop / Start | Pause and resume sampling |
+| Stop / Start | Pause and resume sampling (decoupled from view interaction) |
 | Clear | Clear the plot buffer |
 
-Saturation reference line shown in red dashes at the OPA323 ceiling. Status bar shows `⚠ SENSOR SAT` or `⚠ ADC SAT` when the latest reading is saturated.
+Stats overlays operate over the actually-visible x-range (read from the axis), not a fixed window. User pan/zoom via the matplotlib toolbar drops Follow latest / Auto Y-scale automatically but never stops capturing. Saturation reference line shown in red dashes at the OPA323 ceiling. Status bar (sidebar bottom) shows `⚠ SENSOR SAT` or `⚠ ADC SAT` when the latest reading is saturated.
 
 ## Arduino CLI setup
 ```bash
@@ -136,7 +153,7 @@ arduino-cli lib install "Adafruit ADS1X15"
 ## Notes
 - Arduino sketch filename must match its directory name (`lightsensor/lightsensor.ino`)
 - ESP8266 needs to be in `dialout` group: `sudo usermod -aG dialout $USER`
-- Serial baud: 9600
+- Serial baud: 115200
 - On Linux, do NOT set RTS/DTR before opening the port — any transition triggers the NodeMCU auto-reset circuit and causes a full USB disconnect/reconnect. On Windows, deassert both before open to avoid WriteFile error 22.
 - ADS1115 input hard-limited to VDD+0.3V = 3.6V; do not apply 5V signals or power the sensor from a higher supply without checking I2C pull-up voltage
 - Slow downward drift observed — likely thermal warmup of ADC reference or op-amp offset drift
