@@ -74,7 +74,7 @@ def autodetect_port():
 
 
 class LightSensor:
-    def __init__(self, port=None, baud=9600):
+    def __init__(self, port=None, baud=115200):
         self.port = port or autodetect_port()
         self.baud = baud
         self.ser = None

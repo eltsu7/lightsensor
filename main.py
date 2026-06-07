@@ -204,96 +204,92 @@ class SensorApp:
         root.title(f"Light Sensor ({port})")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # --- control bar ---------------------------------------------------
-        controls = ttk.Frame(root, padding=8)
-        controls.pack(side=tk.TOP, fill=tk.X)
+        # --- sidebar (right) ----------------------------------------------
+        sidebar = ttk.Frame(root, padding=8)
+        sidebar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        def section(title):
+            ttk.Label(sidebar, text=title, font=("TkDefaultFont", 9, "bold")).pack(
+                side=tk.TOP, anchor=tk.W, pady=(10, 2)
+            )
+            frame = ttk.Frame(sidebar)
+            frame.pack(side=tk.TOP, fill=tk.X)
+            return frame
+
+        # View section
+        view = section("View")
+        self.follow_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            view, text="Follow latest", variable=self.follow_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
         self.autoscale_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            controls,
-            text="Auto Y-scale",
-            variable=self.autoscale_var,
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        self.ymin_var = tk.StringVar(value="0")
-        self.ymax_var = tk.StringVar(value="4")
-        self._ymin_entry = ttk.Entry(controls, width=5, textvariable=self.ymin_var)
-        self._ymin_entry.pack(side=tk.LEFT, padx=(0, 2))
-        ttk.Label(controls, text="–").pack(side=tk.LEFT)
-        self._ymax_entry = ttk.Entry(controls, width=5, textvariable=self.ymax_var)
-        self._ymax_entry.pack(side=tk.LEFT, padx=(2, 16))
-        self.autoscale_var.trace_add("write", lambda *_: self._update_yrange_state())
-        self._update_yrange_state()
+            view, text="Auto Y-scale", variable=self.autoscale_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
+        self.absscale_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            view, text="Absolute scale", variable=self.absscale_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
 
+        # Overlays section
+        overlays = section("Overlays")
         self.avg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            controls,
-            text="Window average",
-            variable=self.avg_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-
+            overlays, text="Window average", variable=self.avg_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
         self.fit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            controls,
-            text="Line fit",
-            variable=self.fit_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-
+            overlays, text="Line fit", variable=self.fit_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
         self.noise_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            controls,
-            text="Noise band",
-            variable=self.noise_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
+            overlays, text="Noise band", variable=self.noise_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
 
-        self.absscale_var = tk.BooleanVar(value=True)
-        self.absscale_var.trace_add("write", lambda *_: self.sampler.clear())
-        ttk.Checkbutton(
-            controls,
-            text="Absolute scale",
-            variable=self.absscale_var,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-
-        ttk.Label(controls, text="Gain:").pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(controls, text="−", width=2, command=self._gain_down).pack(side=tk.LEFT)
+        # Gain section
+        gain = section("Gain")
+        gain_row = ttk.Frame(gain)
+        gain_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(gain_row, text="−", width=2, command=self._gain_down).pack(side=tk.LEFT)
         self.gain_var = tk.StringVar(value=GAIN_LABELS[DEFAULT_GAIN])
         gain_combo = ttk.Combobox(
-            controls,
-            width=8,
-            state="readonly",
-            values=GAIN_LABELS,
-            textvariable=self.gain_var,
+            gain_row, width=8, state="readonly",
+            values=GAIN_LABELS, textvariable=self.gain_var,
         )
         gain_combo.pack(side=tk.LEFT, padx=2)
         gain_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_gain())
-        ttk.Button(controls, text="+", width=2, command=self._gain_up).pack(side=tk.LEFT, padx=(0, 16))
+        ttk.Button(gain_row, text="+", width=2, command=self._gain_up).pack(side=tk.LEFT)
+        self._oneshot_btn = ttk.Button(gain, text="One-shot gain", command=self._oneshot_autogain)
+        self._oneshot_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        self._autogain_btn = ttk.Button(gain, text="Auto gain", command=self._toggle_autogain)
+        self._autogain_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
-        ttk.Separator(controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        self._oneshot_btn = ttk.Button(controls, text="One-shot gain", command=self._oneshot_autogain)
-        self._oneshot_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self._autogain_btn = ttk.Button(controls, text="Auto gain", command=self._toggle_autogain)
-        self._autogain_btn.pack(side=tk.LEFT, padx=(0, 16))
-
-        ttk.Label(controls, text="Scan interval (ms):").pack(side=tk.LEFT)
+        # Acquisition section
+        acq = section("Acquisition")
+        interval_row = ttk.Frame(acq)
+        interval_row.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(interval_row, text="Scan interval (ms):").pack(side=tk.LEFT)
         self.interval_var = tk.StringVar(value=str(int(sampler.interval_s * 1000)))
-        interval_entry = ttk.Entry(controls, width=7, textvariable=self.interval_var)
+        interval_entry = ttk.Entry(interval_row, width=6, textvariable=self.interval_var)
         interval_entry.pack(side=tk.LEFT, padx=(4, 4))
         interval_entry.bind("<Return>", lambda _e: self._apply_interval())
-        ttk.Button(controls, text="Apply", command=self._apply_interval).pack(
-            side=tk.LEFT
+        ttk.Button(acq, text="Apply interval", command=self._apply_interval).pack(
+            side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
-
-        self.startstop_btn = ttk.Button(
-            controls, text="Stop", width=6, command=self._toggle_run
-        )
-        self.startstop_btn.pack(side=tk.LEFT, padx=(16, 4))
-        ttk.Button(controls, text="Clear", command=self.sampler.clear).pack(
-            side=tk.LEFT
+        self.startstop_btn = ttk.Button(acq, text="Stop", command=self._toggle_run)
+        self.startstop_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Button(acq, text="Clear", command=self.sampler.clear).pack(
+            side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(controls, textvariable=self.status_var).pack(side=tk.RIGHT)
+        ttk.Label(sidebar, textvariable=self.status_var, wraplength=160).pack(
+            side=tk.BOTTOM, anchor=tk.W, pady=(10, 0)
+        )
 
         # --- plot ----------------------------------------------------------
+        plot_frame = ttk.Frame(root)
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.fig = Figure(figsize=(8, 4.5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         (self.line,) = self.ax.plot([], [], lw=1.5, color="tab:orange", zorder=3)
@@ -312,16 +308,38 @@ class SensorApp:
         self.ax.set_ylim(0, 100)
         self.ax.grid(True, alpha=0.3)
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        NavigationToolbar2Tk(self.canvas, root)  # pan/zoom/save toolbar
+        NavigationToolbar2Tk(self.canvas, plot_frame)  # pan/zoom/save toolbar
+
+        # Detect user-driven axis changes (toolbar pan/zoom) so we can drop the
+        # automatic following/scaling. Our own programmatic limit updates are
+        # guarded by _suppress_lim_cb so they don't trip these callbacks.
+        self._suppress_lim_cb = False
+        self.ax.callbacks.connect("xlim_changed", self._on_xlim_changed)
+        self.ax.callbacks.connect("ylim_changed", self._on_ylim_changed)
 
         self._schedule_redraw()
 
-    def _update_yrange_state(self):
-        state = tk.DISABLED if self.autoscale_var.get() else tk.NORMAL
-        self._ymin_entry.config(state=state)
-        self._ymax_entry.config(state=state)
+    def _set_xlim(self, lo, hi):
+        self._suppress_lim_cb = True
+        self.ax.set_xlim(lo, hi)
+        self._suppress_lim_cb = False
+
+    def _set_ylim(self, lo, hi):
+        self._suppress_lim_cb = True
+        self.ax.set_ylim(lo, hi)
+        self._suppress_lim_cb = False
+
+    def _on_xlim_changed(self, _ax):
+        # User panned/zoomed in time -> stop following the newest points.
+        if not self._suppress_lim_cb:
+            self.follow_var.set(False)
+
+    def _on_ylim_changed(self, _ax):
+        # User zoomed the Y-axis -> drop automatic Y-scaling.
+        if not self._suppress_lim_cb:
+            self.autoscale_var.set(False)
 
     def _toggle_run(self):
         if self.sampler.acquiring:
@@ -415,12 +433,16 @@ class SensorApp:
             self.status_var.set(status)
 
         if times:
-            xmax = times[-1]
-            xmin = max(0.0, xmax - WINDOW_SECONDS)
-            self.ax.set_xlim(xmin, xmax if xmax > xmin else xmin + 1)
+            # Follow the live window only when requested; user pan/zoom turns
+            # this off automatically (via _on_xlim_changed).
+            if self.follow_var.get():
+                xmax = times[-1]
+                xmin = max(0.0, xmax - WINDOW_SECONDS)
+                self._set_xlim(xmin, xmax if xmax > xmin else xmin + 1)
 
-            # Data within the visible window, used for stats overlays.
-            win = [(t, v) for t, v in zip(times, values) if t >= xmin]
+            # Stats/overlays operate over whatever x-range is actually visible.
+            xmin, xmax = self.ax.get_xlim()
+            win = [(t, v) for t, v in zip(times, values) if xmin <= t <= xmax]
             wt = np.array([t for t, _ in win])
             wv = np.array([v for _, v in win])
 
@@ -471,18 +493,15 @@ class SensorApp:
             elif self.ax.get_legend() is not None:
                 self.ax.get_legend().remove()
 
+            # Auto Y-scale fits the visible data; user Y-zoom turns it off
+            # automatically (via _on_ylim_changed).
             if self.autoscale_var.get():
                 window = list(wv) if wv.size else values
                 lo, hi = min(window), max(window)
                 # Pad by 10% of the visible range, but at least 0.1% of the
                 # signal magnitude so a stable signal still has breathing room.
                 pad = max((hi - lo) * 0.1, abs((hi + lo) / 2) * 0.001, 1e-6)
-                self.ax.set_ylim(lo - pad, hi + pad)
-            else:
-                try:
-                    self.ax.set_ylim(float(self.ymin_var.get()), float(self.ymax_var.get()))
-                except ValueError:
-                    pass  # keep current limits if input is invalid
+                self._set_ylim(lo - pad, hi + pad)
 
         self.canvas.draw_idle()
 
@@ -503,7 +522,7 @@ def main():
         default=None,
         help="Serial port of the sensor (e.g. COM5). Auto-detected if omitted.",
     )
-    parser.add_argument("--baud", type=int, default=9600, help="Serial baud rate")
+    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
     parser.add_argument(
         "--interval",
         type=float,

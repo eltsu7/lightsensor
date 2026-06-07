@@ -19,9 +19,13 @@ float gainVoltages[] = {6.144, 4.096, 2.048, 1.024, 0.512, 0.256};
 int currentGain = 1;
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   ads.begin();
   ads.setGain(gains[currentGain]);
+  ads.setDataRate(RATE_ADS1115_860SPS);
+  // NOTE: 400kHz I2C caused comms failure (all zeros) with the Soldered
+  // breakout's onboard pull-ups over jumper wires. Leave at default 100kHz.
+  // Wire.setClock(400000);
 }
 
 void loop() {
