@@ -35,9 +35,9 @@ def best_gain(max_voltage, headroom=0.85):
 
 @dataclass
 class Reading:
-    value: float      # light level, % of ADC full-scale (0–100)
+    value: float  # light level, % of ADC full-scale (0–100)
     sensor_sat: bool  # op-amp near supply rail (gain full-scale > VDD)
-    adc_sat: bool     # ADC raw hit 32767 (gain full-scale < VDD)
+    adc_sat: bool  # ADC raw hit 32767 (gain full-scale < VDD)
 
 
 def autodetect_port():
@@ -82,7 +82,7 @@ class LightSensor:
         # Continuous autogain: when True, read() manages gain automatically.
         self.autogain = False
         self.autogain_interval = 0.25  # seconds between gain evaluations
-        self.autogain_window = 0.5    # seconds of history to consider
+        self.autogain_window = 0.5  # seconds of history to consider
         self._autogain_history: list = []  # (timestamp, voltage_V) pairs
         self._autogain_last_check = 0.0
         self.open()
@@ -128,7 +128,11 @@ class LightSensor:
         if len(parts) != 3:
             return None
         try:
-            raw, sensor_sat, adc_sat = int(parts[0]), bool(int(parts[1])), bool(int(parts[2]))
+            raw, sensor_sat, adc_sat = (
+                int(parts[0]),
+                bool(int(parts[1])),
+                bool(int(parts[2])),
+            )
         except ValueError:
             return None
         reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)

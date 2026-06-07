@@ -15,8 +15,14 @@ from matplotlib.backends.backend_tkagg import (
 from matplotlib.figure import Figure
 
 from lightsensor import (
-    LightSensor, Reading, autodetect_port, best_gain,
-    GAIN_LABELS, GAIN_VOLTAGES, DEFAULT_GAIN, SATURATION_VOLTAGE,
+    LightSensor,
+    Reading,
+    autodetect_port,
+    best_gain,
+    GAIN_LABELS,
+    GAIN_VOLTAGES,
+    DEFAULT_GAIN,
+    SATURATION_VOLTAGE,
 )
 
 # Defaults
@@ -220,30 +226,42 @@ class SensorApp:
         view = section("View")
         self.follow_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            view, text="Follow latest", variable=self.follow_var,
+            view,
+            text="Follow latest",
+            variable=self.follow_var,
         ).pack(side=tk.TOP, anchor=tk.W)
         self.autoscale_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            view, text="Auto Y-scale", variable=self.autoscale_var,
+            view,
+            text="Auto Y-scale",
+            variable=self.autoscale_var,
         ).pack(side=tk.TOP, anchor=tk.W)
         self.absscale_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            view, text="Absolute scale", variable=self.absscale_var,
+            view,
+            text="Absolute scale",
+            variable=self.absscale_var,
         ).pack(side=tk.TOP, anchor=tk.W)
 
         # Overlays section
         overlays = section("Overlays")
         self.avg_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            overlays, text="Window average", variable=self.avg_var,
+            overlays,
+            text="Window average",
+            variable=self.avg_var,
         ).pack(side=tk.TOP, anchor=tk.W)
         self.fit_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            overlays, text="Line fit", variable=self.fit_var,
+            overlays,
+            text="Line fit",
+            variable=self.fit_var,
         ).pack(side=tk.TOP, anchor=tk.W)
         self.noise_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            overlays, text="Noise band", variable=self.noise_var,
+            overlays,
+            text="Noise band",
+            variable=self.noise_var,
         ).pack(side=tk.TOP, anchor=tk.W)
 
         # Gain section
@@ -253,8 +271,11 @@ class SensorApp:
         ttk.Button(gain_row, text="−", width=2, command=self._gain_down).pack(side=tk.LEFT)
         self.gain_var = tk.StringVar(value=GAIN_LABELS[DEFAULT_GAIN])
         gain_combo = ttk.Combobox(
-            gain_row, width=8, state="readonly",
-            values=GAIN_LABELS, textvariable=self.gain_var,
+            gain_row,
+            width=8,
+            state="readonly",
+            values=GAIN_LABELS,
+            textvariable=self.gain_var,
         )
         gain_combo.pack(side=tk.LEFT, padx=2)
         gain_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_gain())
@@ -300,9 +321,7 @@ class SensorApp:
             [], [], lw=1.5, ls="--", color="tab:green", label="fit", zorder=1
         )
         self._noise_patch = None
-        self.sat_line = self.ax.axhline(
-            y=0, color="red", ls="--", lw=0.8, alpha=0.5, zorder=2
-        )
+        self.sat_line = self.ax.axhline(y=0, color="red", ls="--", lw=0.8, alpha=0.5, zorder=2)
         self.ax.set_xlabel("Time (s)")
         self.ax.set_ylabel("Light (%)")
         self.ax.set_ylim(0, 100)
@@ -469,12 +488,17 @@ class SensorApp:
                     [xmin, xmax],
                     [mean - std, mean - std],
                     [mean + std, mean + std],
-                    alpha=0.2, color="tab:red", zorder=0,
+                    alpha=0.2,
+                    color="tab:red",
+                    zorder=0,
                 )
-                legend_handles.append(Patch(
-                    facecolor="tab:red", alpha=0.4,
-                    label=f"σ = {std:{rfmt}} {unit}  ({rel:.2f} %)  p-p = {ptp:{rfmt}} {unit}",
-                ))
+                legend_handles.append(
+                    Patch(
+                        facecolor="tab:red",
+                        alpha=0.4,
+                        label=f"σ = {std:{rfmt}} {unit}  ({rel:.2f} %)  p-p = {ptp:{rfmt}} {unit}",
+                    )
+                )
 
             if self.fit_var.get() and wv.size >= 2 and np.ptp(wt) > 0:
                 slope, intercept = np.polyfit(wt, wv, 1)

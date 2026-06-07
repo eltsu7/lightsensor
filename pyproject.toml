@@ -8,3 +8,6 @@ dependencies = [
     "matplotlib>=3.10.9",
     "pyserial>=3.5",
 ]
+
+[tool.ruff]
+line-length = 100
