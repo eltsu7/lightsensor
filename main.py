@@ -46,7 +46,7 @@ class SensorSampler:
         self._skip_next = False  # discard one sample after a gain change
         self._sensor_sat = False
         self._adc_sat = False
-        self._autogain_continuous = False
+        self._autogain_continuous = True
         self._oneshot_n = 0
         self._oneshot_collected = 0
         self._times = deque(maxlen=MAX_POINTS)
@@ -242,6 +242,25 @@ class SensorApp:
             text="Absolute scale",
             variable=self.absscale_var,
         ).pack(side=tk.TOP, anchor=tk.W)
+        self.rawpoints_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            view,
+            text="Show raw data points",
+            variable=self.rawpoints_var,
+        ).pack(side=tk.TOP, anchor=tk.W)
+        rollavg_row = ttk.Frame(view)
+        rollavg_row.pack(side=tk.TOP, fill=tk.X, anchor=tk.W)
+        self.rollavg_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            rollavg_row,
+            text="Rolling average",
+            variable=self.rollavg_var,
+        ).pack(side=tk.LEFT)
+        self.rollavg_sec_var = tk.StringVar(value="0.05")
+        ttk.Entry(rollavg_row, width=4, textvariable=self.rollavg_sec_var).pack(
+            side=tk.LEFT, padx=(4, 2)
+        )
+        ttk.Label(rollavg_row, text="s").pack(side=tk.LEFT)
 
         # Overlays section
         overlays = section("Overlays")
@@ -282,7 +301,8 @@ class SensorApp:
         ttk.Button(gain_row, text="+", width=2, command=self._gain_up).pack(side=tk.LEFT)
         self._oneshot_btn = ttk.Button(gain, text="One-shot gain", command=self._oneshot_autogain)
         self._oneshot_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
-        self._autogain_btn = ttk.Button(gain, text="Auto gain", command=self._toggle_autogain)
+        autogain_label = "Auto gain ●" if sampler.autogain_continuous else "Auto gain"
+        self._autogain_btn = ttk.Button(gain, text=autogain_label, command=self._toggle_autogain)
         self._autogain_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
         # Acquisition section
@@ -319,6 +339,9 @@ class SensorApp:
         )
         (self.fit_line,) = self.ax.plot(
             [], [], lw=1.5, ls="--", color="tab:green", label="fit", zorder=1
+        )
+        (self.rollavg_line,) = self.ax.plot(
+            [], [], lw=1.5, color="tab:purple", zorder=4, label="rolling avg"
         )
         self._noise_patch = None
         self.sat_line = self.ax.axhline(y=0, color="red", ls="--", lw=0.8, alpha=0.5, zorder=2)
@@ -408,6 +431,17 @@ class SensorApp:
             return
         self.sampler.interval_s = ms / 1000.0
 
+    @staticmethod
+    def _rolling_average(times, values, window_s):
+        """Trailing moving average: each point is the mean of all samples
+        within the preceding window_s seconds. Vectorised via prefix sums."""
+        prefix = np.concatenate([[0.0], np.cumsum(values)])
+        lefts = np.searchsorted(times, times - window_s, side="left")
+        idx = np.arange(len(values))
+        counts = idx - lefts + 1
+        sums = prefix[idx + 1] - prefix[lefts]
+        return sums / counts
+
     def _redraw(self):
         times, values = self.sampler.snapshot()
 
@@ -425,6 +459,23 @@ class SensorApp:
             self.ax.set_ylabel("Light (%)")
 
         self.line.set_data(times, values)
+        self.line.set_visible(self.rawpoints_var.get())
+
+        # Rolling average (trailing window in seconds).
+        if self.rollavg_var.get() and len(values) >= 2:
+            try:
+                win_s = float(self.rollavg_sec_var.get())
+            except ValueError:
+                win_s = 0.0
+            if win_s > 0:
+                ra = self._rolling_average(np.array(times), np.array(values), win_s)
+                self.rollavg_line.set_data(times, ra)
+                self.rollavg_line.set_visible(True)
+            else:
+                self.rollavg_line.set_visible(False)
+        else:
+            self.rollavg_line.set_visible(False)
+
         self.sat_line.set_ydata([sat_threshold, sat_threshold])
         # Sync gain combobox with whatever gain is currently active
         # (may have been changed by autogain).

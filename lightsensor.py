@@ -4,10 +4,14 @@ import serial
 import serial.tools.list_ports
 import time
 
-# USB identifiers and description hints for the sensor's USB-to-UART bridge
-# (Silicon Labs CP210x).
-_KNOWN_HWIDS = ((0x10C4, 0xEA60),)  # (VID, PID) for CP210x
-_DESCRIPTION_HINTS = ("cp210", "silicon labs", "uart")
+# USB identifiers and description hints for the supported boards:
+#   - ESP8266 NodeMCU v2 via Silicon Labs CP210x USB-to-UART bridge
+#   - ESP32-C3 SuperMini via the chip's native USB JTAG/serial
+_KNOWN_HWIDS = (
+    (0x10C4, 0xEA60),  # CP210x (ESP8266 NodeMCU)
+    (0x303A, 0x1001),  # Espressif native USB (ESP32-C3)
+)
+_DESCRIPTION_HINTS = ("cp210", "silicon labs", "uart", "esp32", "espressif", "jtag")
 
 # Gain index maps to: 0=±6.144V, 1=±4.096V, 2=±2.048V, 3=±1.024V, 4=±0.512V, 5=±0.256V
 GAIN_LABELS = ["±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V"]
