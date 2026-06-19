@@ -93,6 +93,9 @@ Sensor and ADC saturation are mutually exclusive with this hardware: sensor_sat 
 | `average` | Number of ADC samples the firmware averages per `read()` (default 1) |
 | `info` | `DeviceInfo` from the connect handshake (`product`, `proto`, `fw`, `id`) |
 | `ping()` / `identify()` | Link health check / query identity (`DeviceInfo`) |
+| `connected` | Whether the serial port is currently open |
+| `reconnect(attempts=5, backoff=0.5)` | Re-detect port + reopen + handshake after a disconnect; returns `True`/`False`, never raises |
+| `auto_reconnect` | Opt-in (default `False`): `read()` reconnects transparently on a link error instead of raising |
 | `reading_voltage(reading)` | Absolute dark-corrected voltage for a `Reading` at the current gain |
 | `read_physical(source=None)` | Read once and convert to a physical value via the cached calibration |
 | `load_calibration()` | Fetch device calibration into `self.calibration` (cache) |
@@ -102,6 +105,8 @@ Sensor and ADC saturation are mutually exclusive with this hardware: sensor_sat 
 Firmware-side averaging: `read()` sends `r<n>` and the device averages `n` raw ADC samples, returning one `Reading`. Reduces noise by ~√n at the cost of proportionally slower reads.
 
 The dark offset is stored as a voltage (gain-independent) so it stays correct across gain changes. `read()` subtracts it from `value`; `sensor_sat`/`adc_sat` still reflect the true raw level.
+
+**Thread safety & reconnect:** every serial transaction is guarded by a re-entrant lock, so a single `LightSensor` is safe to share across threads (the GUI sampler is single-threaded, but library consumers aren't constrained to that). A cleanly-closed port is transparently reopened on the next call. On a genuine link error, behaviour depends on `auto_reconnect`: off (default) re-raises `SerialException`/`OSError` so a caller with its own reconnect loop (e.g. `main.py`) handles it; on, `read()` calls `reconnect()` and returns `None` for that sample. `reconnect()` re-detects the port because the device can re-enumerate under a new path after a replug.
 
 ### Calibration & physical units (`Calibration`)
 The device stores a spectral responsivity curve `R(λ)` + metadata (`scale_factor`, `scale_units`, `device_id`, `cal_date`, …); all unit conversion happens host-side. `LightSensor.read_calibration()` returns a `Calibration`:

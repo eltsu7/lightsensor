@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import binascii
 import logging
+import threading
 import serial
 import time
 
@@ -250,6 +251,14 @@ class LightSensor:
         self.info = None
         # Cached calibration (loaded on demand via load_calibration()).
         self.calibration = None
+        # Re-entrant lock guarding every serial transaction so the driver is
+        # safe to share across threads (e.g. the GUI sampler). Re-entrant
+        # because higher-level calls nest lower-level ones (zero() -> read()).
+        self._lock = threading.RLock()
+        # Opt-in: when True, read() transparently reconnects on a link error
+        # instead of raising. Off by default so callers that manage their own
+        # reconnect (e.g. main.py) keep seeing the exception.
+        self.auto_reconnect = False
         self.open()
 
     def open(self):
@@ -259,16 +268,50 @@ class LightSensor:
         circuit to work around, so a plain open is fine on both Linux and
         Windows.
         """
-        self.close()
-        self.ser = serial.Serial(self.port, self.baud, timeout=1)
-        self._handshake()
+        with self._lock:
+            self.close()
+            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            self._handshake()
+
+    @property
+    def connected(self):
+        """True if the serial port is currently open."""
+        return self.ser is not None and self.ser.is_open
+
+    def reconnect(self, attempts=5, backoff=0.5):
+        """Re-establish the link after a disconnect (e.g. unplug/replug).
+
+        Re-detects the port if the original path is gone (the device may
+        re-enumerate to a different name), reopens, and handshakes. Returns True
+        once connected, False if all attempts fail. Raises nothing.
+        """
+        with self._lock:
+            for i in range(attempts):
+                try:
+                    self.close()
+                    # The device can re-enumerate under a new path; re-detect if
+                    # the configured one isn't present, but keep an explicit port.
+                    try:
+                        self.port = autodetect_port()
+                    except Exception:
+                        pass  # fall back to the existing self.port
+                    self.ser = serial.Serial(self.port, self.baud, timeout=1)
+                    self._handshake()
+                    if self.connected:
+                        log.info("reconnected to %s", self.port)
+                        return True
+                except (serial.SerialException, OSError) as exc:
+                    log.warning("reconnect attempt %d/%d failed: %s", i + 1, attempts, exc)
+                time.sleep(backoff)
+            return False
 
     def ping(self):
         """Return True if the device answers `pong`. No I2C — pure link check."""
-        if self.ser is None or not self.ser.is_open:
-            return False
-        self.ser.write(b"p")
-        return self.ser.readline().decode(errors="ignore").strip() == "pong"
+        with self._lock:
+            if not self.connected:
+                return False
+            self.ser.write(b"p")
+            return self.ser.readline().decode(errors="ignore").strip() == "pong"
 
     def _try_sync(self):
         """Drain stale input and probe once with a ping. True if `pong` returns."""
@@ -277,10 +320,11 @@ class LightSensor:
 
     def identify(self):
         """Query device identity (`I`). Returns DeviceInfo or None on failure."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(b"I")
-        line = self.ser.readline().decode(errors="ignore").strip()
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"I")
+            line = self.ser.readline().decode(errors="ignore").strip()
         return parse_identity(line)
 
     # Longest the device can block waiting for a command's payload (the `W`
@@ -317,29 +361,55 @@ class LightSensor:
                 self.port, self.info.proto, PROTO_VERSION,
             )
 
+    def _read_raw(self):
+        """One locked serial transaction: send 'r<n>' and parse the reply line.
+
+        Returns (raw, sensor_sat, adc_sat) or None on a timeout / malformed line.
+        Raises serial.SerialException / OSError if the link is gone — callers
+        decide whether to reconnect. Logs parse failures so a bad stream isn't
+        silently swallowed.
+        """
+        n = self.average if self.average and self.average > 1 else 1
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(f"r{n}\n".encode())
+            line = self.ser.readline().decode(errors="ignore").strip()
+        if not line:
+            log.debug("read timeout (no line)")
+            return None
+        parts = line.split(",")
+        if len(parts) != 3:
+            log.debug("read parse error: %r", line)
+            return None
+        try:
+            return int(parts[0]), bool(int(parts[1])), bool(int(parts[2]))
+        except ValueError:
+            log.debug("read parse error: %r", line)
+            return None
+
     def read(self):
         """Return a Reading(value, sensor_sat, adc_sat) or None on parse failure.
 
         value      -- light level as % of ADC full-scale (0–100)
         sensor_sat -- op-amp output near supply rail (low-gain settings)
         adc_sat    -- ADC raw reading hit 32767 (high-gain settings)
+
+        On a link error: if auto_reconnect is set, transparently reconnects and
+        returns None for this sample; otherwise the exception propagates so a
+        caller managing its own reconnect can handle it.
         """
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        n = self.average if self.average and self.average > 1 else 1
-        self.ser.write(f"r{n}\n".encode())
-        line = self.ser.readline().decode(errors="ignore").strip()
-        parts = line.split(",")
-        if len(parts) != 3:
-            return None
         try:
-            raw, sensor_sat, adc_sat = (
-                int(parts[0]),
-                bool(int(parts[1])),
-                bool(int(parts[2])),
-            )
-        except ValueError:
+            raw_parts = self._read_raw()
+        except (serial.SerialException, OSError) as exc:
+            if not self.auto_reconnect:
+                raise
+            log.warning("read link error: %s — reconnecting", exc)
+            self.reconnect()
             return None
+        if raw_parts is None:
+            return None
+        raw, sensor_sat, adc_sat = raw_parts
         gain_at_read = self.gain
         reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
         # Autogain and saturation must see the TRUE level, so run autogain on
@@ -452,10 +522,11 @@ class LightSensor:
 
     def set_gain(self, gain_index):
         """Set ADC gain. gain_index 0–5 maps to ±6.144V … ±0.256V. Returns True on success."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(f"g{gain_index}".encode())
-        resp = self.ser.readline().decode(errors="ignore").strip()
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(f"g{gain_index}".encode())
+            resp = self.ser.readline().decode(errors="ignore").strip()
         if resp == "ok":
             self.gain = gain_index
             return True
@@ -464,39 +535,42 @@ class LightSensor:
 
     def get_gain(self):
         """Return current gain index (0–5), or None on failure."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(b"G")
-        resp = self.ser.readline().decode(errors="ignore").strip()
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"G")
+            resp = self.ser.readline().decode(errors="ignore").strip()
         return int(resp) if resp.isdigit() else None
 
     # --- Calibration storage (on-device LittleFS) ---------------------------
 
     def has_calibration(self):
         """Return the stored calibration size in bytes (0 if none)."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(b"H")
-        resp = self.ser.readline().decode(errors="ignore").strip()
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"H")
+            resp = self.ser.readline().decode(errors="ignore").strip()
         return int(resp) if resp.isdigit() else 0
 
     def write_calibration(self, text):
         """Store calibration CSV text on the device. Returns True if the
         device-computed CRC32 matches the host's (transfer verified)."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
         data = text.encode() if isinstance(text, str) else text
         expected = binascii.crc32(data) & 0xFFFFFFFF
-        self.ser.write(f"W{len(data)}\n".encode())
-        self.ser.flush()
-        # Throttle the payload: a single fast burst overruns the device's
-        # USB-CDC RX buffer (it can't drain while writing flash), dropping
-        # bytes. Small flushed chunks with a brief pause keep it reliable.
-        for i in range(0, len(data), 128):
-            self.ser.write(data[i : i + 128])
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(f"W{len(data)}\n".encode())
             self.ser.flush()
-            time.sleep(0.002)
-        resp = self.ser.readline().decode(errors="ignore").strip()
+            # Throttle the payload: a single fast burst overruns the device's
+            # USB-CDC RX buffer (it can't drain while writing flash), dropping
+            # bytes. Small flushed chunks with a brief pause keep it reliable.
+            for i in range(0, len(data), 128):
+                self.ser.write(data[i : i + 128])
+                self.ser.flush()
+                time.sleep(0.002)
+            resp = self.ser.readline().decode(errors="ignore").strip()
         parts = resp.split()
         if len(parts) == 2 and parts[0] == "ok":
             ok = int(parts[1]) == expected
@@ -516,17 +590,18 @@ class LightSensor:
     def read_calibration(self):
         """Read the stored calibration. Returns a Calibration, or None if the
         device has no calibration or the CRC32 check fails."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(b"C")
-        header = self.ser.readline().decode(errors="ignore").strip()
-        parts = header.split()
-        if len(parts) != 2:
-            return None
-        size, crc = int(parts[0]), int(parts[1])
-        if size == 0:
-            return None
-        data = self.ser.read(size)  # blocks up to the serial timeout
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"C")
+            header = self.ser.readline().decode(errors="ignore").strip()
+            parts = header.split()
+            if len(parts) != 2:
+                return None
+            size, crc = int(parts[0]), int(parts[1])
+            if size == 0:
+                return None
+            data = self.ser.read(size)  # blocks up to the serial timeout
         if len(data) != size or (binascii.crc32(data) & 0xFFFFFFFF) != crc:
             return None
         return parse_calibration(data.decode(errors="ignore"))
@@ -542,18 +617,20 @@ class LightSensor:
 
     def clear_calibration(self):
         """Erase the stored calibration. Returns True on success."""
-        if self.ser is None or not self.ser.is_open:
-            self.open()
-        self.ser.write(b"X")
-        ok = self.ser.readline().decode(errors="ignore").strip() == "ok"
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"X")
+            ok = self.ser.readline().decode(errors="ignore").strip() == "ok"
         if ok:
             self.calibration = None  # invalidate cache
         return ok
 
     def close(self):
-        if self.ser is not None and self.ser.is_open:
-            self.ser.close()
-        self.ser = None
+        with self._lock:
+            if self.ser is not None and self.ser.is_open:
+                self.ser.close()
+            self.ser = None
 
     def __enter__(self):
         return self
