@@ -207,21 +207,30 @@ void readCalibration() {
 
 // Identity line for the host handshake. Space-separated key=value pairs after a
 // fixed product token, e.g.:
-//   lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 ngains=6
+//   lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 vsat=3.20 gains=6.144,...
 // id is the 48-bit eFuse MAC (unique per chip), usable as a serial number.
+// The firmware is the source of truth for the gain table and saturation
+// voltage; it reports them here so the host driver can verify its mirror.
 void sendIdentity() {
   uint64_t mac = ESP.getEfuseMac();
   char id[13];
   snprintf(id, sizeof(id), "%04X%08X",
            (uint16_t)(mac >> 32), (uint32_t)mac);
+  int ngains = (int)(sizeof(gainVoltages) / sizeof(gainVoltages[0]));
   Serial.print("lightsensor proto=");
   Serial.print(PROTO_VERSION);
   Serial.print(" fw=");
   Serial.print(FW_VERSION);
   Serial.print(" id=");
   Serial.print(id);
-  Serial.print(" sps=860 ngains=");
-  Serial.println((int)(sizeof(gains) / sizeof(gains[0])));
+  Serial.print(" sps=860 vsat=");
+  Serial.print(SENSOR_SAT_V);
+  Serial.print(" gains=");
+  for (int i = 0; i < ngains; i++) {
+    if (i) Serial.print(",");
+    Serial.print(gainVoltages[i], 3);
+  }
+  Serial.println();
 }
 
 void loop() {

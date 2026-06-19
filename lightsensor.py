@@ -355,11 +355,38 @@ class LightSensor:
         self.info = self.identify()
         if self.info is None:
             log.warning("device on %s did not report identity (old firmware?)", self.port)
-        elif self.info.proto != PROTO_VERSION:
+            return
+        if self.info.proto != PROTO_VERSION:
             log.warning(
                 "protocol mismatch on %s: device proto=%d, driver expects %d",
                 self.port, self.info.proto, PROTO_VERSION,
             )
+        self._verify_constants()
+
+    def _verify_constants(self):
+        """Warn if the driver's mirrored constants drift from the device's.
+
+        The firmware is the source of truth for the gain table and saturation
+        voltage and reports them in the identity line; this catches a driver/
+        firmware mismatch (e.g. after editing one but not the other) at connect.
+        """
+        fields = self.info.fields
+        if "gains" in fields:
+            try:
+                dev = [float(x) for x in fields["gains"].split(",")]
+            except ValueError:
+                dev = None
+            if dev and dev != GAIN_VOLTAGES:
+                log.warning("gain table mismatch: device=%s driver=%s", dev, GAIN_VOLTAGES)
+        if "vsat" in fields:
+            try:
+                if abs(float(fields["vsat"]) - SATURATION_VOLTAGE) > 0.01:
+                    log.warning(
+                        "saturation voltage mismatch: device=%s driver=%s",
+                        fields["vsat"], SATURATION_VOLTAGE,
+                    )
+            except ValueError:
+                pass
 
     def _read_raw(self):
         """One locked serial transaction: send 'r<n>' and parse the reply line.
