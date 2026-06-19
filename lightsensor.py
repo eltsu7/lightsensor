@@ -101,8 +101,93 @@ class Calibration:
 
     @property
     def scale_factor(self):
+        """Absolute scale (physical_unit per volt), or None if uncalibrated.
+
+        Set by one reference measurement against a known source/meter. Until
+        that's taken it may be a placeholder (e.g. 1.0); a value of None or 1.0
+        means readings are not yet absolutely calibrated.
+        """
         v = self.metadata.get("scale_factor")
         return float(v) if v is not None else None
+
+    @property
+    def scale_units(self):
+        """Unit string the scale_factor maps to, e.g. 'W/m^2' (None if unset)."""
+        return self.metadata.get("scale_units")
+
+    def responsivity_at(self, wl):
+        """Relative responsivity R(λ) at one wavelength by linear interpolation.
+
+        Returns 0.0 outside the measured band (the sensor has no calibrated
+        response there). Assumes wavelengths are ascending, as written by the
+        monochromator sweep.
+        """
+        wls, rs = self.wavelengths, self.responsivity
+        if not wls or wl < wls[0] or wl > wls[-1]:
+            return 0.0
+        # Binary search for the bracketing pair.
+        lo, hi = 0, len(wls) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if wls[mid] <= wl:
+                lo = mid
+            else:
+                hi = mid
+        span = wls[hi] - wls[lo]
+        if span == 0:
+            return rs[lo]
+        frac = (wl - wls[lo]) / span
+        return rs[lo] + frac * (rs[hi] - rs[lo])
+
+    def source_weighted_responsivity(self, source_wl, source_intensity):
+        """Source-weighted mean responsivity R̄ = ∫ s(λ)R(λ) dλ / ∫ s(λ) dλ.
+
+        s is the (relative) source spectrum sampled at `source_wl`; R is this
+        calibration's responsivity, interpolated onto the same wavelengths.
+        Trapezoidal integration over the source grid. This is the factor that
+        makes the same voltage mean different physical levels for different
+        source spectra. Returns None if the integral can't be formed.
+        """
+        if len(source_wl) != len(source_intensity) or len(source_wl) < 2:
+            return None
+        num = den = 0.0
+        for i in range(len(source_wl) - 1):
+            w0, w1 = source_wl[i], source_wl[i + 1]
+            dw = w1 - w0
+            if dw <= 0:
+                continue
+            s0, s1 = source_intensity[i], source_intensity[i + 1]
+            r0 = self.responsivity_at(w0)
+            r1 = self.responsivity_at(w1)
+            num += 0.5 * (s0 * r0 + s1 * r1) * dw
+            den += 0.5 * (s0 + s1) * dw
+        if den == 0:
+            return None
+        return num / den
+
+    def voltage_to_value(self, voltage, source=None):
+        """Convert a (dark-corrected) sensor voltage to a physical value.
+
+        Model: physical = scale_factor · V / R̄_source
+
+        source -- (wavelengths, intensities) of the light being measured, or
+            None. The sensor integrates the source over its spectral response,
+            so the same voltage means different physical levels for different
+            spectra; supplying the source applies that spectral correction.
+            With source=None, R̄_source defaults to 1.0 — i.e. you're measuring
+            the same spectrum the absolute scale was calibrated against.
+
+        Returns the value in `scale_units`, or None if no scale_factor is set
+        or the source spectrum doesn't overlap the calibrated band.
+        """
+        if self.scale_factor is None:
+            return None
+        r_bar = 1.0
+        if source is not None:
+            r_bar = self.source_weighted_responsivity(source[0], source[1])
+            if not r_bar:  # None or 0 — no usable overlap
+                return None
+        return self.scale_factor * voltage / r_bar
 
 
 def parse_calibration(text):
@@ -163,6 +248,8 @@ class LightSensor:
         self.average = 1
         # Identity reported by the device at connect (None until handshake runs).
         self.info = None
+        # Cached calibration (loaded on demand via load_calibration()).
+        self.calibration = None
         self.open()
 
     def open(self):
@@ -265,6 +352,31 @@ class LightSensor:
         if self._zero_offset_v:
             reading.value -= self._zero_offset_v / GAIN_VOLTAGES[gain_at_read] * 100
         return reading
+
+    def reading_voltage(self, reading):
+        """Sensor voltage (V) for a Reading at the current gain, dark-corrected.
+
+        Reading.value is % of full-scale, which is gain-relative; this recovers
+        the absolute voltage the physical conversion needs.
+        """
+        return reading.value / 100 * GAIN_VOLTAGES[self.gain]
+
+    def read_physical(self, source=None):
+        """Read once and convert to a physical value via the cached calibration.
+
+        Loads calibration on first use (see load_calibration). Returns the value
+        in `calibration.scale_units`, or None if there's no reading, no
+        calibration/scale_factor, or the source spectrum doesn't overlap the
+        calibrated band. `source` is forwarded to Calibration.voltage_to_value.
+        """
+        if self.calibration is None:
+            self.load_calibration()
+        if self.calibration is None:
+            return None
+        reading = self.read()
+        if reading is None:
+            return None
+        return self.calibration.voltage_to_value(self.reading_voltage(reading), source)
 
     def zero(self, n=50):
         """Measure the dark/background level over n samples and subtract it from
@@ -390,6 +502,8 @@ class LightSensor:
             ok = int(parts[1]) == expected
             if not ok:
                 log.warning("write_calibration CRC mismatch: device=%s host=%s", parts[1], expected)
+            elif self.calibration is not None:
+                self.calibration = None  # invalidate cache; reloaded on next use
             return ok
         log.warning("write_calibration failed: %s", _err_text(resp))
         return False
@@ -417,12 +531,24 @@ class LightSensor:
             return None
         return parse_calibration(data.decode(errors="ignore"))
 
+    def load_calibration(self):
+        """Read the device calibration and cache it in self.calibration.
+
+        Returns the Calibration (or None if the device has none). read_physical()
+        calls this on first use; call it explicitly to refresh after a write.
+        """
+        self.calibration = self.read_calibration()
+        return self.calibration
+
     def clear_calibration(self):
         """Erase the stored calibration. Returns True on success."""
         if self.ser is None or not self.ser.is_open:
             self.open()
         self.ser.write(b"X")
-        return self.ser.readline().decode(errors="ignore").strip() == "ok"
+        ok = self.ser.readline().decode(errors="ignore").strip() == "ok"
+        if ok:
+            self.calibration = None  # invalidate cache
+        return ok
 
     def close(self):
         if self.ser is not None and self.ser.is_open:

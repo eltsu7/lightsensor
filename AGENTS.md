@@ -19,6 +19,8 @@ Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1
 | `port_detect.py` | Cross-platform serial-port auto-detection; importable and runnable (`uv run python port_detect.py` prints the port — used by the justfile when flashing) |
 | `main.py` | Debug GUI — Tkinter, threaded sampler, live plot |
 | `test_read.py` | Smoke test — auto-connect, read 10 samples, print values + sample rate |
+| `test_calibration.py` | Unit tests for the volts→units conversion math (pure, no hardware) |
+| `calibration_dummy.csv` | Placeholder spectral responsivity curve (400 pts) until monochromator data exists |
 | `justfile` | `just compile`, `just upload`, `just flash` (port auto-detected) |
 | `docs/` | ADS1115, OPA323, Soldered 333095 breakout datasheets |
 | `TODO_v2.md` | Plans for v2 (ESP32-C3 SuperMini, on-board ADC, new cable) |
@@ -89,10 +91,31 @@ Sensor and ADC saturation are mutually exclusive with this hardware: sensor_sat 
 | `clear_zero()` | Remove the dark offset |
 | `is_zeroed` / `zero_offset` | Whether an offset is active / its value in volts |
 | `average` | Number of ADC samples the firmware averages per `read()` (default 1) |
+| `info` | `DeviceInfo` from the connect handshake (`product`, `proto`, `fw`, `id`) |
+| `ping()` / `identify()` | Link health check / query identity (`DeviceInfo`) |
+| `reading_voltage(reading)` | Absolute dark-corrected voltage for a `Reading` at the current gain |
+| `read_physical(source=None)` | Read once and convert to a physical value via the cached calibration |
+| `load_calibration()` | Fetch device calibration into `self.calibration` (cache) |
+| `read_calibration()` / `write_calibration(text)` / `write_calibration_file(path)` | Low-level cal transfer (CRC-verified) |
+| `has_calibration()` / `clear_calibration()` | Stored cal size / erase |
 
 Firmware-side averaging: `read()` sends `r<n>` and the device averages `n` raw ADC samples, returning one `Reading`. Reduces noise by ~√n at the cost of proportionally slower reads.
 
 The dark offset is stored as a voltage (gain-independent) so it stays correct across gain changes. `read()` subtracts it from `value`; `sensor_sat`/`adc_sat` still reflect the true raw level.
+
+### Calibration & physical units (`Calibration`)
+The device stores a spectral responsivity curve `R(λ)` + metadata (`scale_factor`, `scale_units`, `device_id`, `cal_date`, …); all unit conversion happens host-side. `LightSensor.read_calibration()` returns a `Calibration`:
+
+| Member | Description |
+|--------|-------------|
+| `scale_factor` / `scale_units` | Absolute scale (physical_unit per volt) and its unit string |
+| `responsivity_at(wl)` | `R(λ)` by linear interpolation; `0` outside the measured band |
+| `source_weighted_responsivity(wl, intensity)` | `R̄ = ∫sR dλ / ∫s dλ` for a source spectrum (trapezoidal) |
+| `voltage_to_value(voltage, source=None)` | Convert a dark-corrected voltage to a physical value |
+
+**Conversion model:** `physical = scale_factor · V / R̄_source`. The sensor integrates the incident light over its spectral response, so the same voltage means different physical levels for different source spectra — supplying `source` (a `(wavelengths, intensities)` pair) applies that spectral correction. `source=None` ⇒ `R̄_source = 1.0`, i.e. you're measuring the same spectrum the absolute scale was calibrated against. Returns `None` when there's no `scale_factor` (uncalibrated) or the source doesn't overlap the calibrated band.
+
+**Not yet absolutely calibrated:** `scale_factor` is a placeholder (1.0) until a reference measurement against a known source/meter is taken, and `R(λ)` is dummy data until measured on a monochromator. The conversion *pipeline* is implemented and unit-tested (`test_calibration.py`); only the numbers are pending. Convolving `R(λ)` against a real source spectrum (and photopic weighting for lux) stays a host-side step on top of this.
 
 ## Device Interface (Serial)
 
