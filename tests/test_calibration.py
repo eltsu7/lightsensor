@@ -1,9 +1,14 @@
 """Unit tests for the calibration / volts→units conversion math.
 
-Pure functions only — no hardware required. Run with: uv run test_calibration.py
+Pure functions only — no hardware required. Run with: uv run tests/test_calibration.py
 """
 
-from lightsensor import parse_calibration
+import os
+
+from lightmeter.sensor import parse_calibration
+
+# Repo root, so the dummy data path is independent of the caller's cwd.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def approx(a, b, tol=1e-9):
@@ -88,7 +93,7 @@ def test_source_outside_band_returns_none():
 
 def test_dummy_csv_loads():
     # The shipped dummy file parses and has the expected shape.
-    with open("calibration_dummy.csv") as f:
+    with open(os.path.join(ROOT, "data", "calibration_dummy.csv")) as f:
         cal = parse_calibration(f.read())
     assert len(cal.wavelengths) == 400
     assert cal.scale_factor == 1.0

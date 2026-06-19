@@ -1,7 +1,7 @@
 """Quick smoke test: auto-connect, read N samples, print them with timing."""
 
 import time
-from lightsensor import LightSensor, GAIN_LABELS
+from lightmeter.sensor import LightSensor, GAIN_LABELS
 
 N = 10
 

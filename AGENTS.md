@@ -14,13 +14,13 @@ Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1
 ## Files
 | File | Description |
 |------|-------------|
-| `lightsensor/lightsensor.ino` | Arduino sketch (ESP32-C3) — device interface over serial |
-| `lightsensor.py` | Sensor driver — `LightSensor` class, `Reading` dataclass, `best_gain()`, autogain |
-| `port_detect.py` | Cross-platform serial-port auto-detection; importable and runnable (`uv run python port_detect.py` prints the port — used by the justfile when flashing) |
-| `main.py` | Debug GUI — Tkinter, threaded sampler, live plot |
-| `test_read.py` | Smoke test — auto-connect, read 10 samples, print values + sample rate |
-| `test_calibration.py` | Unit tests for the volts→units conversion math (pure, no hardware) |
-| `calibration_dummy.csv` | Placeholder spectral responsivity curve (400 pts) until monochromator data exists |
+| `firmware/lightsensor/lightsensor.ino` | Arduino sketch (ESP32-C3) — device interface over serial (dir name must match the `.ino`) |
+| `lightmeter/sensor.py` | Sensor driver — `LightSensor` class, `Reading`/`Calibration` dataclasses, `best_gain()`, autogain |
+| `lightmeter/port_detect.py` | Cross-platform serial-port auto-detection; runnable (`uv run python lightmeter/port_detect.py` prints the port — used by the justfile when flashing) |
+| `lightmeter/gui.py` | Debug GUI — Tkinter, threaded sampler, live plot (`lightmeter` console script) |
+| `tests/test_read.py` | Smoke test — auto-connect, read 10 samples, print values + sample rate |
+| `tests/test_calibration.py` | Unit tests for the volts→units conversion math (pure, no hardware) |
+| `data/calibration_dummy.csv` | Placeholder spectral responsivity curve (400 pts) until monochromator data exists |
 | `justfile` | `just compile`, `just upload`, `just flash` (port auto-detected) |
 | `docs/` | ADS1115, OPA323, Soldered 333095 breakout datasheets |
 | `TODO_v2.md` | Plans for v2 (ESP32-C3 SuperMini, on-board ADC, new cable) |
@@ -34,13 +34,13 @@ just flash
 
 **Run debug GUI:**
 ```bash
-uv run main.py                 # auto-detects port
-uv run main.py --port COM5     # or specify explicitly
+uv run python -m lightmeter.gui              # auto-detects port (or: lightmeter)
+uv run python -m lightmeter.gui --port COM5  # or specify explicitly
 ```
 
 **Use driver in code:**
 ```python
-from lightsensor import LightSensor
+from lightmeter import LightSensor
 
 with LightSensor() as sensor:      # port auto-detected if omitted
     sensor.set_gain(2)             # ±2.048V
@@ -54,7 +54,7 @@ with LightSensor() as sensor:      # port auto-detected if omitted
     sensor.autogain = True         # continuous autogain inside read()
 ```
 
-## Driver API (`lightsensor.py`)
+## Driver API (`lightmeter/sensor.py`)
 
 ### Constants
 | Name | Description |
@@ -106,7 +106,7 @@ Firmware-side averaging: `read()` sends `r<n>` and the device averages `n` raw A
 
 The dark offset is stored as a voltage (gain-independent) so it stays correct across gain changes. `read()` subtracts it from `value`; `sensor_sat`/`adc_sat` still reflect the true raw level.
 
-**Thread safety & reconnect:** every serial transaction is guarded by a re-entrant lock, so a single `LightSensor` is safe to share across threads (the GUI sampler is single-threaded, but library consumers aren't constrained to that). A cleanly-closed port is transparently reopened on the next call. On a genuine link error, behaviour depends on `auto_reconnect`: off (default) re-raises `SerialException`/`OSError` so a caller with its own reconnect loop (e.g. `main.py`) handles it; on, `read()` calls `reconnect()` and returns `None` for that sample. `reconnect()` re-detects the port because the device can re-enumerate under a new path after a replug.
+**Thread safety & reconnect:** every serial transaction is guarded by a re-entrant lock, so a single `LightSensor` is safe to share across threads (the GUI sampler is single-threaded, but library consumers aren't constrained to that). A cleanly-closed port is transparently reopened on the next call. On a genuine link error, behaviour depends on `auto_reconnect`: off (default) re-raises `SerialException`/`OSError` so a caller with its own reconnect loop (e.g. the GUI sampler) handles it; on, `read()` calls `reconnect()` and returns `None` for that sample. `reconnect()` re-detects the port because the device can re-enumerate under a new path after a replug.
 
 ### Calibration & physical units (`Calibration`)
 The device stores a spectral responsivity curve `R(λ)` + metadata (`scale_factor`, `scale_units`, `device_id`, `cal_date`, …); all unit conversion happens host-side. `LightSensor.read_calibration()` returns a `Calibration`:
@@ -143,7 +143,7 @@ Commands sent over serial at 115200 baud:
 
 ### Protocol contract
 - **`I` (identity):** product token + space-separated `key=value` pairs. `proto` is the protocol version (bump on any breaking command/response change); `fw` the firmware version; `id` the 48-bit eFuse MAC as hex, usable as a per-unit serial number. The driver runs this on connect (`LightSensor.info`) and warns on a `proto` mismatch.
-- **Error codes** (`err <code>`): 1 bad arg, 2 bad length, 3 out of memory, 4 transfer timeout / short read, 5 filesystem open failed, 6 write size mismatch, 7 erase failed. Mirrored in `lightsensor.py` `ERR_MESSAGES`.
+- **Error codes** (`err <code>`): 1 bad arg, 2 bad length, 3 out of memory, 4 transfer timeout / short read, 5 filesystem open failed, 6 write size mismatch, 7 erase failed. Mirrored in `lightmeter/sensor.py` `ERR_MESSAGES`.
 - **Resync / recovery:** every device-side read self-times-out (≤5 s for `W`), so the device never blocks forever. On connect the driver handshakes: drain input → ping until `pong` → read identity. If desynced (e.g. an interrupted `W`), the driver goes **silent** for longer than the device timeout to let the stuck command self-abort — it must not keep pinging, since each byte feeds the pending read and resets its timeout. A `W` that aborts on timeout discards only the partial upload; stored calibration is preserved.
 
 **Read speed (ESP32-C3, single-shot ADC, 860 SPS, 100 kHz I2C):** ~330 reads/s (1 sample). Averaging multiplies the per-read time by `n`. The ~2.5 ms/sample floor is ADC conversion + I2C; lowering it needs continuous-conversion mode + ALERT/RDY on a GPIO (currently tied to ground).
@@ -158,7 +158,7 @@ Commands sent over serial at 115200 baud:
 | 4 | ±0.512V | ADC (32767) |
 | 5 | ±0.256V | ADC (32767) |
 
-## Debug GUI (`main.py`)
+## Debug GUI (`lightmeter/gui.py`)
 
 Threaded sampler reads as fast as the device allows (decoupled from ~33 fps display). Values are stored as actual voltage (V) so data is gain-independent and preserved across gain changes.
 

@@ -5,7 +5,7 @@ import threading
 import serial
 import time
 
-from port_detect import autodetect_port
+from lightmeter.port_detect import autodetect_port
 
 log = logging.getLogger(__name__)
 

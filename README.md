@@ -15,12 +15,12 @@ uv sync          # or: pip install -e .
 ## Use
 
 ```bash
-just flash       # build + upload firmware (port auto-detected)
-uv run main.py   # debug GUI  (or: lightmeter)
+just flash                  # build + upload firmware (port auto-detected)
+uv run python -m lightmeter.gui   # debug GUI  (or just: lightmeter)
 ```
 
 ```python
-from lightsensor import LightSensor
+from lightmeter import LightSensor
 
 with LightSensor() as sensor:        # port auto-detected
     print(sensor.info)               # device identity / firmware

@@ -17,9 +17,8 @@ from matplotlib.backends.backend_tkagg import (
 )
 from matplotlib.figure import Figure
 
-from lightsensor import (
+from lightmeter.sensor import (
     LightSensor,
-    Reading,
     autodetect_port,
     best_gain,
     GAIN_LABELS,
