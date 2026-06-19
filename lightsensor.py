@@ -1,17 +1,9 @@
-import sys
 from dataclasses import dataclass
+import binascii
 import serial
-import serial.tools.list_ports
 import time
 
-# USB identifiers and description hints for the supported boards:
-#   - ESP8266 NodeMCU v2 via Silicon Labs CP210x USB-to-UART bridge
-#   - ESP32-C3 SuperMini via the chip's native USB JTAG/serial
-_KNOWN_HWIDS = (
-    (0x10C4, 0xEA60),  # CP210x (ESP8266 NodeMCU)
-    (0x303A, 0x1001),  # Espressif native USB (ESP32-C3)
-)
-_DESCRIPTION_HINTS = ("cp210", "silicon labs", "uart", "esp32", "espressif", "jtag")
+from port_detect import autodetect_port
 
 # Gain index maps to: 0=±6.144V, 1=±4.096V, 2=±2.048V, 3=±1.024V, 4=±0.512V, 5=±0.256V
 GAIN_LABELS = ["±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V"]
@@ -38,43 +30,56 @@ def best_gain(max_voltage, headroom=0.85):
 
 
 @dataclass
+class Calibration:
+    """Parsed calibration: metadata header + spectral responsivity curve."""
+
+    metadata: dict  # header key/value pairs (device_id, cal_date, scale_factor, …)
+    wavelengths: list  # nm
+    responsivity: list  # one value per wavelength
+    raw_text: str  # the original CSV as stored on the device
+
+    @property
+    def scale_factor(self):
+        v = self.metadata.get("scale_factor")
+        return float(v) if v is not None else None
+
+
+def parse_calibration(text):
+    """Parse calibration CSV text into a Calibration.
+
+    Header lines start with '#' as 'key: value'. The data section is a
+    'wavelength_nm,responsivity' table.
+    """
+    metadata = {}
+    wavelengths = []
+    responsivity = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            body = line[1:].strip()
+            if ":" in body:
+                key, val = body.split(":", 1)
+                metadata[key.strip()] = val.strip()
+            continue
+        if line.lower().startswith("wavelength"):
+            continue  # column header
+        parts = line.split(",")
+        if len(parts) >= 2:
+            try:
+                wavelengths.append(float(parts[0]))
+                responsivity.append(float(parts[1]))
+            except ValueError:
+                pass
+    return Calibration(metadata, wavelengths, responsivity, text)
+
+
+@dataclass
 class Reading:
     value: float  # light level, % of ADC full-scale (0–100)
     sensor_sat: bool  # op-amp near supply rail (gain full-scale > VDD)
     adc_sat: bool  # ADC raw hit 32767 (gain full-scale < VDD)
-
-
-def autodetect_port():
-    """Return the serial port the sensor is most likely connected to.
-
-    Prefers a known CP210x bridge (by USB VID/PID, then by description). If
-    nothing matches but exactly one port exists, that port is used. Raises
-    RuntimeError if no suitable port can be determined.
-    """
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        raise RuntimeError("No serial ports found. Is the sensor plugged in?")
-
-    # 1) Match by USB VID/PID.
-    for p in ports:
-        if p.vid is not None and (p.vid, p.pid) in _KNOWN_HWIDS:
-            return p.device
-
-    # 2) Match by description / hardware-id text.
-    for p in ports:
-        text = f"{p.description} {p.hwid}".lower()
-        if any(hint in text for hint in _DESCRIPTION_HINTS):
-            return p.device
-
-    # 3) Fall back to the only available port.
-    if len(ports) == 1:
-        return ports[0].device
-
-    available = ", ".join(f"{p.device} ({p.description})" for p in ports)
-    raise RuntimeError(
-        "Could not auto-detect the sensor port. Specify one with --port. "
-        f"Available ports: {available}"
-    )
 
 
 class LightSensor:
@@ -89,33 +94,23 @@ class LightSensor:
         self.autogain_window = 0.5  # seconds of history to consider
         self._autogain_history: list = []  # (timestamp, voltage_V) pairs
         self._autogain_last_check = 0.0
+        # Dark-offset ("zero"): voltage subtracted from every reading. Stored
+        # as volts so it stays correct across gain changes.
+        self._zero_offset_v = 0.0
+        # Firmware-side averaging: each read() averages this many ADC samples
+        # on the device and returns one Reading.
+        self.average = 1
         self.open()
 
     def open(self):
-        """(Re)open the serial port and give the device time to reset."""
+        """(Re)open the serial port.
+
+        The ESP32-C3 uses native USB CDC, which has no DTR/RTS auto-reset
+        circuit to work around, so a plain open is fine on both Linux and
+        Windows.
+        """
         self.close()
-        ser = serial.Serial()
-        ser.port = self.port
-        ser.baudrate = self.baud
-        ser.timeout = 1
-        if sys.platform == "win32":
-            # On Windows the CP210x bridge asserts RTS/DTR by default, which
-            # triggers the ESP8266 auto-reset circuit and causes WriteFile
-            # error 22. Deassert both before opening to prevent this.
-            ser.rts = False
-            ser.dtr = False
-            ser.open()
-            self.ser = ser
-            time.sleep(1)
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-        else:
-            # On Linux, changing DTR/RTS causes a transition that trips the
-            # NodeMCU auto-reset circuit, making the CP210x do a full USB
-            # disconnect/reconnect. Leave the lines untouched so the device
-            # never resets when we open the port.
-            ser.open()
-            self.ser = ser
+        self.ser = serial.Serial(self.port, self.baud, timeout=1)
 
     def read(self):
         """Return a Reading(value, sensor_sat, adc_sat) or None on parse failure.
@@ -126,7 +121,8 @@ class LightSensor:
         """
         if self.ser is None or not self.ser.is_open:
             self.open()
-        self.ser.write(b"r")
+        n = self.average if self.average and self.average > 1 else 1
+        self.ser.write(f"r{n}\n".encode())
         line = self.ser.readline().decode(errors="ignore").strip()
         parts = line.split(",")
         if len(parts) != 3:
@@ -139,10 +135,53 @@ class LightSensor:
             )
         except ValueError:
             return None
+        gain_at_read = self.gain
         reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
+        # Autogain and saturation must see the TRUE level, so run autogain on
+        # the un-zeroed reading first.
         if self.autogain:
             self._autogain_update(reading)
+        # Subtract the dark offset as the very last step (display only) so it
+        # never affects gain selection or saturation. Use the gain the sample
+        # was actually taken at, in case autogain just changed it.
+        if self._zero_offset_v:
+            reading.value -= self._zero_offset_v / GAIN_VOLTAGES[gain_at_read] * 100
         return reading
+
+    def zero(self, n=50):
+        """Measure the dark/background level over n samples and subtract it from
+        all future reads. Returns the measured offset in volts.
+
+        Continuous autogain and any existing offset are suspended during the
+        measurement so the true level is captured at the current gain.
+        """
+        was_autogain = self.autogain
+        prev_offset = self._zero_offset_v
+        self.autogain = False
+        self._zero_offset_v = 0.0
+        try:
+            voltages = []
+            for _ in range(n):
+                r = self.read()
+                if r is not None:
+                    voltages.append(r.value * GAIN_VOLTAGES[self.gain] / 100)
+            self._zero_offset_v = sum(voltages) / len(voltages) if voltages else prev_offset
+        finally:
+            self.autogain = was_autogain
+        return self._zero_offset_v
+
+    def clear_zero(self):
+        """Remove the dark offset so reads return the raw level again."""
+        self._zero_offset_v = 0.0
+
+    @property
+    def is_zeroed(self):
+        return self._zero_offset_v != 0.0
+
+    @property
+    def zero_offset(self):
+        """Current dark offset in volts (0.0 if not zeroed)."""
+        return self._zero_offset_v
 
     def _autogain_update(self, reading):
         now = time.monotonic()
@@ -165,7 +204,9 @@ class LightSensor:
         gain stays fixed for the full sample set.
         """
         was_autogain = self.autogain
+        prev_offset = self._zero_offset_v
         self.autogain = False
+        self._zero_offset_v = 0.0  # select gain on the true level, not zeroed
         try:
             voltages = []
             for _ in range(n):
@@ -176,6 +217,7 @@ class LightSensor:
                 self.set_gain(best_gain(max(voltages)))
         finally:
             self.autogain = was_autogain
+            self._zero_offset_v = prev_offset
         return self.gain
 
     def set_gain(self, gain_index):
@@ -196,6 +238,68 @@ class LightSensor:
         self.ser.write(b"G")
         resp = self.ser.readline().decode(errors="ignore").strip()
         return int(resp) if resp.isdigit() else None
+
+    # --- Calibration storage (on-device LittleFS) ---------------------------
+
+    def has_calibration(self):
+        """Return the stored calibration size in bytes (0 if none)."""
+        if self.ser is None or not self.ser.is_open:
+            self.open()
+        self.ser.write(b"H")
+        resp = self.ser.readline().decode(errors="ignore").strip()
+        return int(resp) if resp.isdigit() else 0
+
+    def write_calibration(self, text):
+        """Store calibration CSV text on the device. Returns True if the
+        device-computed CRC32 matches the host's (transfer verified)."""
+        if self.ser is None or not self.ser.is_open:
+            self.open()
+        data = text.encode() if isinstance(text, str) else text
+        expected = binascii.crc32(data) & 0xFFFFFFFF
+        self.ser.write(f"W{len(data)}\n".encode())
+        self.ser.flush()
+        # Throttle the payload: a single fast burst overruns the device's
+        # USB-CDC RX buffer (it can't drain while writing flash), dropping
+        # bytes. Small flushed chunks with a brief pause keep it reliable.
+        for i in range(0, len(data), 128):
+            self.ser.write(data[i : i + 128])
+            self.ser.flush()
+            time.sleep(0.002)
+        resp = self.ser.readline().decode(errors="ignore").strip()
+        parts = resp.split()
+        if len(parts) == 2 and parts[0] == "ok":
+            return int(parts[1]) == expected
+        return False
+
+    def write_calibration_file(self, path):
+        """Store a calibration CSV file from disk. Returns True on verified write."""
+        with open(path, "r") as f:
+            return self.write_calibration(f.read())
+
+    def read_calibration(self):
+        """Read the stored calibration. Returns a Calibration, or None if the
+        device has no calibration or the CRC32 check fails."""
+        if self.ser is None or not self.ser.is_open:
+            self.open()
+        self.ser.write(b"C")
+        header = self.ser.readline().decode(errors="ignore").strip()
+        parts = header.split()
+        if len(parts) != 2:
+            return None
+        size, crc = int(parts[0]), int(parts[1])
+        if size == 0:
+            return None
+        data = self.ser.read(size)  # blocks up to the serial timeout
+        if len(data) != size or (binascii.crc32(data) & 0xFFFFFFFF) != crc:
+            return None
+        return parse_calibration(data.decode(errors="ignore"))
+
+    def clear_calibration(self):
+        """Erase the stored calibration. Returns True on success."""
+        if self.ser is None or not self.ser.is_open:
+            self.open()
+        self.ser.write(b"X")
+        return self.ser.readline().decode(errors="ignore").strip() == "ok"
 
     def close(self):
         if self.ser is not None and self.ser.is_open:
