@@ -29,5 +29,5 @@ with LightSensor() as sensor:        # port auto-detected
     print(sensor.reading_voltage(reading))
 ```
 
-See [`CLAUDE.md`](CLAUDE.md) for the full hardware notes, serial protocol, and
-driver API.
+See [`docs/reference.md`](docs/reference.md) for the serial protocol, driver API,
+and calibration model.
