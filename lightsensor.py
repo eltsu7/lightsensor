@@ -1,9 +1,36 @@
 from dataclasses import dataclass
 import binascii
+import logging
 import serial
 import time
 
 from port_detect import autodetect_port
+
+log = logging.getLogger(__name__)
+
+# Protocol version this driver speaks. Must match the device's reported `proto`;
+# a mismatch means the command set / response formats may have diverged.
+PROTO_VERSION = 1
+
+# Device error codes returned as "err <code>". Keep in sync with firmware ERR_*.
+ERR_MESSAGES = {
+    1: "bad argument",
+    2: "bad length",
+    3: "out of memory",
+    4: "transfer timeout / short read",
+    5: "filesystem open failed",
+    6: "write size mismatch",
+    7: "erase failed",
+}
+
+
+def _err_text(resp):
+    """Human-readable text for an 'err [code]' response line."""
+    parts = resp.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        code = int(parts[1])
+        return f"err {code} ({ERR_MESSAGES.get(code, 'unknown')})"
+    return resp or "no response"
 
 # Gain index maps to: 0=±6.144V, 1=±4.096V, 2=±2.048V, 3=±1.024V, 4=±0.512V, 5=±0.256V
 GAIN_LABELS = ["±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V"]
@@ -27,6 +54,40 @@ def best_gain(max_voltage, headroom=0.85):
         if max_voltage < threshold:
             return g
     return 0  # fall back to lowest gain (widest range)
+
+
+@dataclass
+class DeviceInfo:
+    """Identity reported by the device's `I` command."""
+
+    product: str  # fixed product token, e.g. "lightsensor"
+    proto: int  # protocol version the device speaks
+    fw: str  # firmware version string
+    id: str  # unique device id (eFuse MAC hex) — usable as a serial number
+    fields: dict  # all parsed key=value pairs (sps, ngains, …)
+
+
+def parse_identity(line):
+    """Parse an identity line into a DeviceInfo, or None if it doesn't look like one.
+
+    Format: '<product> key=value key=value ...' e.g.
+    'lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 ngains=6'
+    """
+    parts = line.split()
+    if not parts or "=" in parts[0]:
+        return None
+    fields = {}
+    for tok in parts[1:]:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            fields[k] = v
+    if "proto" not in fields:
+        return None
+    try:
+        proto = int(fields["proto"])
+    except ValueError:
+        return None
+    return DeviceInfo(parts[0], proto, fields.get("fw", "?"), fields.get("id", "?"), fields)
 
 
 @dataclass
@@ -100,6 +161,8 @@ class LightSensor:
         # Firmware-side averaging: each read() averages this many ADC samples
         # on the device and returns one Reading.
         self.average = 1
+        # Identity reported by the device at connect (None until handshake runs).
+        self.info = None
         self.open()
 
     def open(self):
@@ -111,6 +174,61 @@ class LightSensor:
         """
         self.close()
         self.ser = serial.Serial(self.port, self.baud, timeout=1)
+        self._handshake()
+
+    def ping(self):
+        """Return True if the device answers `pong`. No I2C — pure link check."""
+        if self.ser is None or not self.ser.is_open:
+            return False
+        self.ser.write(b"p")
+        return self.ser.readline().decode(errors="ignore").strip() == "pong"
+
+    def _try_sync(self):
+        """Drain stale input and probe once with a ping. True if `pong` returns."""
+        self.ser.reset_input_buffer()
+        return self.ping()
+
+    def identify(self):
+        """Query device identity (`I`). Returns DeviceInfo or None on failure."""
+        if self.ser is None or not self.ser.is_open:
+            self.open()
+        self.ser.write(b"I")
+        line = self.ser.readline().decode(errors="ignore").strip()
+        return parse_identity(line)
+
+    # Longest the device can block waiting for a command's payload (the `W`
+    # receive loop). Recovery must wait at least this long, in silence, for a
+    # stuck command to self-abort.
+    DEVICE_CMD_TIMEOUT = 5.0
+
+    def _handshake(self):
+        """Re-establish a clean command stream after (re)opening the port.
+
+        A killed script or interrupted transfer can leave the device mid-command
+        with unread bytes, desyncing the stream. If a quick ping doesn't get a
+        clean `pong`, the device is likely mid-transfer (e.g. a `W` awaiting its
+        payload) — so go SILENT for longer than its receive timeout, letting the
+        stuck command self-abort. Do not keep pinging: each byte we send feeds
+        the pending read and resets its timeout, so it would never recover.
+
+        After resync, read identity and check the protocol version. Best-effort:
+        logs warnings rather than raising so a device with older firmware
+        (no `I`/`p`) still connects. The `W` abort path discards only the partial
+        upload, never the stored calibration.
+        """
+        if not self._try_sync():
+            log.warning("no pong from %s; resyncing (waiting out device timeout)", self.port)
+            time.sleep(self.DEVICE_CMD_TIMEOUT + 0.5)
+            if not self._try_sync():
+                log.warning("%s still unresponsive after resync", self.port)
+        self.info = self.identify()
+        if self.info is None:
+            log.warning("device on %s did not report identity (old firmware?)", self.port)
+        elif self.info.proto != PROTO_VERSION:
+            log.warning(
+                "protocol mismatch on %s: device proto=%d, driver expects %d",
+                self.port, self.info.proto, PROTO_VERSION,
+            )
 
     def read(self):
         """Return a Reading(value, sensor_sat, adc_sat) or None on parse failure.
@@ -229,6 +347,7 @@ class LightSensor:
         if resp == "ok":
             self.gain = gain_index
             return True
+        log.warning("set_gain(%s) failed: %s", gain_index, _err_text(resp))
         return False
 
     def get_gain(self):
@@ -268,7 +387,11 @@ class LightSensor:
         resp = self.ser.readline().decode(errors="ignore").strip()
         parts = resp.split()
         if len(parts) == 2 and parts[0] == "ok":
-            return int(parts[1]) == expected
+            ok = int(parts[1]) == expected
+            if not ok:
+                log.warning("write_calibration CRC mismatch: device=%s host=%s", parts[1], expected)
+            return ok
+        log.warning("write_calibration failed: %s", _err_text(resp))
         return False
 
     def write_calibration_file(self, path):

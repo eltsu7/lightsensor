@@ -5,6 +5,30 @@
 #include <Adafruit_ADS1X15.h>
 #include <LittleFS.h>
 
+// Protocol/firmware identity. Bump PROTO_VERSION on any breaking change to the
+// serial command set or response formats; bump FW_VERSION for any release.
+#define PROTO_VERSION 1
+#define FW_VERSION "1.0.0"
+
+// Error codes returned as "err <code>" by command-style responses. 0 is never
+// emitted (success uses "ok"). Keep in sync with lightsensor.py ERR_*.
+//   1 bad argument        4 transfer timeout / short read
+//   2 bad length          5 filesystem open failed
+//   3 out of memory       6 write size mismatch
+//   7 erase failed
+#define ERR_BAD_ARG  1
+#define ERR_BAD_LEN  2
+#define ERR_NO_MEM   3
+#define ERR_TIMEOUT  4
+#define ERR_FS_OPEN  5
+#define ERR_WRITE    6
+#define ERR_ERASE    7
+
+void sendErr(int code) {
+  Serial.print("err ");
+  Serial.println(code);
+}
+
 // Calibration blob (spectral responsivity CSV + metadata header) lives in a
 // LittleFS file. The host writes/reads it whole; integrity is checked with a
 // CRC32 (standard reflected poly, matches Python's binascii.crc32).
@@ -127,12 +151,12 @@ long readLong() {
 // raw bytes. Replies "ok <crc32>" on success or "err" on timeout/short read.
 void writeCalibration() {
   long n = readLong();
-  if (n <= 0 || n > 65536) { Serial.println("err"); return; }
+  if (n <= 0 || n > 65536) { sendErr(ERR_BAD_LEN); return; }
   // Buffer the whole blob in RAM first. Writing to flash chunk-by-chunk while
   // still receiving lets the USB-CDC RX buffer overflow (flash writes stall the
   // read loop), dropping bytes — so receive fully, then write once.
   uint8_t* data = (uint8_t*)malloc(n);
-  if (!data) { Serial.println("err"); return; }
+  if (!data) { sendErr(ERR_NO_MEM); return; }
   long got = 0;
   unsigned long t0 = millis();
   while (got < n && millis() - t0 < 5000) {
@@ -142,9 +166,9 @@ void writeCalibration() {
       t0 = millis();
     }
   }
-  if (got != n) { free(data); Serial.println("err"); return; }
+  if (got != n) { free(data); sendErr(ERR_TIMEOUT); return; }
   File f = LittleFS.open(CAL_PATH, "w");
-  if (!f) { free(data); Serial.println("err"); return; }
+  if (!f) { free(data); sendErr(ERR_FS_OPEN); return; }
   size_t wrote = f.write(data, n);
   f.close();
   uint32_t crc = crc32_update(0xFFFFFFFF, data, n) ^ 0xFFFFFFFF;
@@ -154,7 +178,7 @@ void writeCalibration() {
     Serial.println(crc);
   } else {
     LittleFS.remove(CAL_PATH);
-    Serial.println("err");
+    sendErr(ERR_WRITE);
   }
 }
 
@@ -181,6 +205,25 @@ void readCalibration() {
   f.close();
 }
 
+// Identity line for the host handshake. Space-separated key=value pairs after a
+// fixed product token, e.g.:
+//   lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 ngains=6
+// id is the 48-bit eFuse MAC (unique per chip), usable as a serial number.
+void sendIdentity() {
+  uint64_t mac = ESP.getEfuseMac();
+  char id[13];
+  snprintf(id, sizeof(id), "%04X%08X",
+           (uint16_t)(mac >> 32), (uint32_t)mac);
+  Serial.print("lightsensor proto=");
+  Serial.print(PROTO_VERSION);
+  Serial.print(" fw=");
+  Serial.print(FW_VERSION);
+  Serial.print(" id=");
+  Serial.print(id);
+  Serial.print(" sps=860 ngains=");
+  Serial.println((int)(sizeof(gains) / sizeof(gains[0])));
+}
+
 void loop() {
   if (Serial.available() > 0) {
     char cmd = Serial.read();
@@ -191,6 +234,9 @@ void loop() {
     } else if (cmd == 'p') {
       Serial.println("pong");  // CDC health check, no I2C
 
+    } else if (cmd == 'I') {
+      sendIdentity();  // product/proto/fw/id line for host handshake
+
     } else if (cmd == 'g') {
       while (!Serial.available());
       char c = Serial.read();
@@ -200,14 +246,14 @@ void loop() {
         ads.setGain(gains[currentGain]);
         Serial.println("ok");
       } else {
-        Serial.println("err");
+        sendErr(ERR_BAD_ARG);
       }
 
     } else if (cmd == 'G') {
       Serial.println(currentGain);
 
     } else if (cmd == 'W') {
-      writeCalibration();  // W<N>\n then N bytes -> "ok <crc>" / "err"
+      writeCalibration();  // W<N>\n then N bytes -> "ok <crc>" / "err <code>"
 
     } else if (cmd == 'C') {
       readCalibration();   // -> "<size> <crc>\n" then <size> bytes
@@ -218,7 +264,8 @@ void loop() {
       if (f) f.close();
 
     } else if (cmd == 'X') {
-      Serial.println(LittleFS.remove(CAL_PATH) ? "ok" : "err");  // erase cal
+      if (LittleFS.remove(CAL_PATH)) Serial.println("ok");
+      else sendErr(ERR_ERASE);  // erase cal
     }
   }
 }

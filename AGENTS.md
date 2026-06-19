@@ -1,11 +1,12 @@
 # LightSensor — Project Summary
 
 ## Overview
-Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1115 16-bit ADC over I2C. Includes an ESP8266-based reader with a live debug GUI.
+Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1115 16-bit ADC over I2C, read by an ESP32-C3 SuperMini. Includes a live debug GUI.
 
 ## Hardware
-- **MCU:** ESP8266 (NodeMCU v2)
-- **ADC:** ADS1115 — connected via I2C (SDA→D2, SCL→D1, ADDR→GND, VDD→3.3V). Currently a Soldered 333095 ADS1115 breakout (datasheet in `docs/`). Runs at 100 kHz I2C and 860 SPS data rate. 400 kHz I2C failed (all zeros) with the breakout's pull-ups over jumper wires.
+- **MCU:** ESP32-C3 SuperMini — native USB-CDC (no USB-UART bridge, no DTR/RTS reset quirks). Port auto-detected (typically `/dev/ttyACM0` on Linux, a `COM` port on Windows). Flash via `just flash`.
+- **I2C pins:** SDA→GPIO10, SCL→GPIO21. ADS1115 ALERT/RDY tied to ground (no data-ready interrupt).
+- **ADC:** ADS1115 on the sensor PCB — ADDR→GND (0x48), VDD→3.3V. Runs at 100 kHz I2C and 860 SPS data rate. 400 kHz I2C failed (all zeros) with an earlier breakout's pull-ups over jumper wires.
 - **Sensor:** Custom PCB using OPA323 op-amp, powered from 3.3V
 - **OPA323 saturation:** ~3.266V (~34 mV below 3.3V rail); both sensor and ADC saturation reported per reading
 - **ADC absolute max input:** VDD + 0.3V = 3.6V — do not exceed regardless of gain setting
@@ -13,12 +14,13 @@ Precision calibrated light sensor using a custom PCB with OPA323 op-amp and ADS1
 ## Files
 | File | Description |
 |------|-------------|
-| `lightsensor/lightsensor.ino` | Arduino sketch — device interface over serial |
+| `lightsensor/lightsensor.ino` | Arduino sketch (ESP32-C3) — device interface over serial |
 | `lightsensor.py` | Sensor driver — `LightSensor` class, `Reading` dataclass, `best_gain()`, autogain |
+| `port_detect.py` | Cross-platform serial-port auto-detection; importable and runnable (`uv run python port_detect.py` prints the port — used by the justfile when flashing) |
 | `main.py` | Debug GUI — Tkinter, threaded sampler, live plot |
 | `test_read.py` | Smoke test — auto-connect, read 10 samples, print values + sample rate |
-| `justfile` | `just compile`, `just upload`, `just flash` |
-| `docs/` | ADS1115, OPA323, ESP8266, Soldered 333095 breakout datasheets |
+| `justfile` | `just compile`, `just upload`, `just flash` (port auto-detected) |
+| `docs/` | ADS1115, OPA323, Soldered 333095 breakout datasheets |
 | `TODO_v2.md` | Plans for v2 (ESP32-C3 SuperMini, on-board ADC, new cable) |
 
 ## Usage
@@ -83,6 +85,14 @@ Sensor and ADC saturation are mutually exclusive with this hardware: sensor_sat 
 | `set_gain(index)` | Sets gain, updates `self.gain`, returns `True` on success |
 | `get_gain()` | Queries current gain index from device |
 | `autogain_oneshot(n=100)` | Collect n samples, apply best gain, return gain index |
+| `zero(n=50)` | Measure dark offset over n samples; subtract from future reads; returns offset (V) |
+| `clear_zero()` | Remove the dark offset |
+| `is_zeroed` / `zero_offset` | Whether an offset is active / its value in volts |
+| `average` | Number of ADC samples the firmware averages per `read()` (default 1) |
+
+Firmware-side averaging: `read()` sends `r<n>` and the device averages `n` raw ADC samples, returning one `Reading`. Reduces noise by ~√n at the cost of proportionally slower reads.
+
+The dark offset is stored as a voltage (gain-independent) so it stays correct across gain changes. `read()` subtracts it from `value`; `sensor_sat`/`adc_sat` still reflect the true raw level.
 
 ## Device Interface (Serial)
 
@@ -90,11 +100,25 @@ Commands sent over serial at 115200 baud:
 
 | Command | Description | Response |
 |---------|-------------|----------|
-| `r` | Read ADC | `raw,sensor_sat,adc_sat\n` — e.g. `15031,0,0` |
-| `g<n>` | Set gain index 0–5 | `ok` or `err` |
+| `r` | Read ADC once (1 sample) | `raw,sensor_sat,adc_sat\n` — e.g. `15031,0,0` |
+| `r<n>` | Read ADC, averaging `n` samples on the device (newline-terminated) | one `raw,s,a\n` line |
+| `g<n>` | Set gain index 0–5 | `ok` or `err <code>` |
 | `G` | Query current gain index | integer + newline |
+| `p` | Ping (CDC link health check, no I2C) | `pong` |
+| `I` | Identity / version handshake | `lightsensor proto=1 fw=1.0.0 id=<MAC> sps=860 ngains=6` |
+| `W<n>\n`+bytes | Write calibration blob (n bytes) | `ok <crc32>` or `err <code>` |
+| `C` | Read calibration | `<size> <crc32>\n` then `<size>` bytes (`0 0` if none) |
+| `H` | Calibration size (has-cal check) | size or `0` |
+| `X` | Erase calibration | `ok` or `err <code>` |
 
-`raw` is the signed 16-bit ADC value (0–32767). `sensor_sat` and `adc_sat` are 0 or 1.
+`raw` is the signed 16-bit ADC value (0–32767). `sensor_sat` and `adc_sat` are 0 or 1. The averaging count is clamped to 1–1000 on the device.
+
+### Protocol contract
+- **`I` (identity):** product token + space-separated `key=value` pairs. `proto` is the protocol version (bump on any breaking command/response change); `fw` the firmware version; `id` the 48-bit eFuse MAC as hex, usable as a per-unit serial number. The driver runs this on connect (`LightSensor.info`) and warns on a `proto` mismatch.
+- **Error codes** (`err <code>`): 1 bad arg, 2 bad length, 3 out of memory, 4 transfer timeout / short read, 5 filesystem open failed, 6 write size mismatch, 7 erase failed. Mirrored in `lightsensor.py` `ERR_MESSAGES`.
+- **Resync / recovery:** every device-side read self-times-out (≤5 s for `W`), so the device never blocks forever. On connect the driver handshakes: drain input → ping until `pong` → read identity. If desynced (e.g. an interrupted `W`), the driver goes **silent** for longer than the device timeout to let the stuck command self-abort — it must not keep pinging, since each byte feeds the pending read and resets its timeout. A `W` that aborts on timeout discards only the partial upload; stored calibration is preserved.
+
+**Read speed (ESP32-C3, single-shot ADC, 860 SPS, 100 kHz I2C):** ~330 reads/s (1 sample). Averaging multiplies the per-read time by `n`. The ~2.5 ms/sample floor is ADC conversion + I2C; lowering it needs continuous-conversion mode + ALERT/RDY on a GPIO (currently tied to ground).
 
 ### Gain index mapping
 | Index | Range | Saturation limit |
@@ -132,28 +156,36 @@ Controls are arranged in a right-hand sidebar grouped into sections.
 | Gain − / combobox / + | Manual gain selection; stops continuous autogain |
 | One-shot gain | Collect 100 samples, apply best gain |
 | Auto gain ● | Continuous autogain; ● indicates active |
+| Zero (dark) / Clear zero | Measure dark offset over 50 samples and subtract from reads; button shows `Zeroed ●` when active. Status shows `zeroing…` during measurement |
 
 ### Acquisition
 | Control | Description |
 |---------|-------------|
 | Scan interval | Target ms between samples (0 = as fast as possible) |
 | Stop / Start | Pause and resume sampling (decoupled from view interaction) |
+| Avg samples | Number of ADC samples the firmware averages per reading (Apply averaging button); reduces noise by ~√n, slower by n |
 | Clear | Clear the plot buffer |
+| ● Record / ■ Stop recording | Capture all samples to an unbounded buffer; on stop, save CSV and open a standalone zoom/pan plot |
 
-Stats overlays operate over the actually-visible x-range (read from the axis), not a fixed window. User pan/zoom via the matplotlib toolbar drops Follow latest / Auto Y-scale automatically but never stops capturing. Saturation reference line shown in red dashes at the OPA323 ceiling. Status bar (sidebar bottom) shows `⚠ SENSOR SAT` or `⚠ ADC SAT` when the latest reading is saturated.
+Stats overlays operate over the actually-visible x-range (read from the axis), not a fixed window. User pan/zoom via the matplotlib toolbar drops Follow latest / Auto Y-scale automatically but never stops capturing. Saturation reference line shown in red dashes at the OPA323 ceiling. Status bar (sidebar bottom) shows `⚠ SENSOR SAT` or `⚠ ADC SAT` when the latest reading is saturated, and `● REC <n>` while recording.
+
+### Recordings
+Recording captures every sample independent of the rolling display buffer. On stop, data is written to `recordings/rec_YYYY-MM-DD_HH-MM-SS.csv` (named by start time, git-ignored) with columns `time_s, voltage_v, sensor_sat, adc_sat`, then opened in a standalone matplotlib window. Two reusable module functions back this: `save_recording(times, values, sensor_sat, adc_sat, started_at)` returns the file path, and `open_recording_plot(parent, path)` opens any such CSV in a zoom/pan viewer — designed so a future "previous measurements" selector only needs to call `open_recording_plot` with a chosen file.
 
 ## Arduino CLI setup
 ```bash
-arduino-cli config add board_manager.additional_urls https://arduino.esp8266.com/stable/package_esp8266com_index.json
+arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 arduino-cli core update-index
-arduino-cli core install esp8266:esp8266
+arduino-cli core install esp32:esp32
 arduino-cli lib install "Adafruit ADS1X15"
 ```
+Flash with `CDCOnBoot=cdc` (already baked into the justfile FQBN) so native USB Serial works.
 
 ## Notes
 - Arduino sketch filename must match its directory name (`lightsensor/lightsensor.ino`)
-- ESP8266 needs to be in `dialout` group: `sudo usermod -aG dialout $USER`
-- Serial baud: 115200
-- On Linux, do NOT set RTS/DTR before opening the port — any transition triggers the NodeMCU auto-reset circuit and causes a full USB disconnect/reconnect. On Windows, deassert both before open to avoid WriteFile error 22.
+- User needs serial access: `sudo usermod -aG dialout $USER` (Linux)
+- Serial baud: 115200 (USB-CDC ignores the rate, but it's set for consistency)
+- Native USB CDC: a plain port open works on Linux and Windows (no DTR/RTS auto-reset workaround needed). A stuck device (e.g. after many killed scripts left unread bytes) clears with an RTS pulse or replug.
+- A clean rebuild may be needed after edits if uploads behave oddly: `arduino-cli compile --clean ...` (stale build cache once caused identical-looking code to "hang").
 - ADS1115 input hard-limited to VDD+0.3V = 3.6V; do not apply 5V signals or power the sensor from a higher supply without checking I2C pull-up voltage
 - Slow downward drift observed — likely thermal warmup of ADC reference or op-amp offset drift
