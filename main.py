@@ -1,8 +1,11 @@
 import argparse
+import csv
 import threading
 import time
 import tkinter as tk
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 from tkinter import ttk
 
 import serial
@@ -31,6 +34,11 @@ WINDOW_SECONDS = 10  # how much history to keep on screen
 REFRESH_MS = 30  # GUI redraw interval (~33 fps); decoupled from sampling
 MAX_POINTS = 20000  # cap on stored points
 
+# Recordings are saved here, one CSV per session, named by start time so a
+# future "previous measurements" selector can list and sort them chronologically.
+RECORDINGS_DIR = Path(__file__).parent / "recordings"
+CSV_COLUMNS = ["time_s", "voltage_v", "sensor_sat", "adc_sat"]
+
 
 class SensorSampler:
     """Reads the sensor in a background thread so serial I/O never blocks or
@@ -49,8 +57,22 @@ class SensorSampler:
         self._autogain_continuous = True
         self._oneshot_n = 0
         self._oneshot_collected = 0
+        self._zero_request = 0  # n samples to zero over (0 = no request)
+        self._clear_zero_req = False
+        self._zeroing = False
+        self._zeroed = False
+        self._zero_offset_v = 0.0
+        self._rate_window = deque()  # recent sample times for sps calc
+        self._average = 1  # firmware-side samples averaged per read
         self._times = deque(maxlen=MAX_POINTS)
         self._values = deque(maxlen=MAX_POINTS)
+        # Recording: unbounded capture independent of the display buffer.
+        self._recording = False
+        self._rec_start = None
+        self._rec_times = []
+        self._rec_values = []
+        self._rec_sensor_sat = []
+        self._rec_adc_sat = []
         self._running = threading.Event()
         self._acquiring = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -91,6 +113,50 @@ class SensorSampler:
     def disable_autogain(self):
         self._autogain_continuous = False
 
+    def start_zero(self, n=50):
+        """Request a dark-offset measurement over n samples (sampler thread)."""
+        self._zero_request = n
+
+    def request_clear_zero(self):
+        self._clear_zero_req = True
+
+    def set_average(self, n):
+        """Set the number of ADC samples the firmware averages per read."""
+        self._average = max(1, int(n))
+
+    @property
+    def average(self):
+        return self._average
+
+    def _note_sample(self, t):
+        """Record a sample timestamp and trim to the last 0.25 s (call under lock)."""
+        self._rate_window.append(t)
+        cutoff = t - 0.25
+        while self._rate_window and self._rate_window[0] < cutoff:
+            self._rate_window.popleft()
+
+    @property
+    def sample_rate(self):
+        """Samples per second over the last ~0.25 s (0 if idle/insufficient)."""
+        with self._lock:
+            w = self._rate_window
+            if len(w) < 2 or time.perf_counter() - w[-1] > 0.5:
+                return 0.0  # idle / paused
+            span = w[-1] - w[0]
+            return (len(w) - 1) / span if span > 0 else 0.0
+
+    @property
+    def zeroing(self):
+        return self._zeroing
+
+    @property
+    def zeroed(self):
+        return self._zeroed
+
+    @property
+    def zero_offset(self):
+        return self._zero_offset_v
+
     @property
     def autogain_continuous(self):
         return self._autogain_continuous
@@ -107,6 +173,34 @@ class SensorSampler:
             self._times.clear()
             self._values.clear()
             self._start = time.perf_counter()
+
+    def start_recording(self):
+        with self._lock:
+            self._rec_times = []
+            self._rec_values = []
+            self._rec_sensor_sat = []
+            self._rec_adc_sat = []
+            self._rec_start = time.perf_counter()
+            self._recording = True
+
+    def stop_recording(self):
+        """Stop recording and return (times, values, sensor_sat, adc_sat) lists."""
+        with self._lock:
+            self._recording = False
+            return (
+                list(self._rec_times),
+                list(self._rec_values),
+                list(self._rec_sensor_sat),
+                list(self._rec_adc_sat),
+            )
+
+    @property
+    def is_recording(self):
+        return self._recording
+
+    @property
+    def recording_count(self):
+        return len(self._rec_times)
 
     def shutdown(self):
         self._running.clear()
@@ -125,6 +219,25 @@ class SensorSampler:
                     sensor = LightSensor(self.port, self.baud)
                     self._applied_gain = None  # reapply gain on fresh connection
                     self.status = "connected"
+
+                sensor.average = self._average
+                if self._clear_zero_req:
+                    self._clear_zero_req = False
+                    sensor.clear_zero()
+                    self._zeroed = False
+                    self._zero_offset_v = 0.0
+                if self._zero_request > 0:
+                    n = self._zero_request
+                    self._zero_request = 0
+                    self._zeroing = True
+                    try:
+                        sensor.zero(n)
+                        self._zeroed = sensor.is_zeroed
+                        self._zero_offset_v = sensor.zero_offset
+                    finally:
+                        self._zeroing = False
+                    self._skip_next = True
+                    continue
                 if self._desired_gain != self._applied_gain:
                     if sensor.set_gain(self._desired_gain):
                         self._applied_gain = self._desired_gain
@@ -171,10 +284,17 @@ class SensorSampler:
                 time.sleep(0.5)
                 continue
 
-            now = time.perf_counter() - self._start
+            t = time.perf_counter()
+            now = t - self._start
             with self._lock:
                 self._times.append(now)
                 self._values.append(value)
+                self._note_sample(t)
+                if self._recording:
+                    self._rec_times.append(t - self._rec_start)
+                    self._rec_values.append(value)
+                    self._rec_sensor_sat.append(int(self._sensor_sat))
+                    self._rec_adc_sat.append(int(self._adc_sat))
 
             # Pace the loop to the (possibly updated) target interval.
             remaining = self.interval_s - (time.perf_counter() - loop_start)
@@ -199,6 +319,62 @@ class SensorSampler:
     def snapshot(self):
         with self._lock:
             return list(self._times), list(self._values)
+
+
+def save_recording(times, values, sensor_sat, adc_sat, started_at=None):
+    """Write a recording to RECORDINGS_DIR as CSV. Returns the file Path.
+
+    Filename is the recording start time so a future selector can list and
+    sort recordings chronologically.
+    """
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    started_at = started_at or datetime.now()
+    path = RECORDINGS_DIR / f"rec_{started_at:%Y-%m-%d_%H-%M-%S}.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for row in zip(times, values, sensor_sat, adc_sat):
+            writer.writerow(row)
+    return path
+
+
+def open_recording_plot(parent, path):
+    """Open a recorded CSV in a standalone, zoom/pan-able plot window.
+
+    Reusable by a future "previous measurements" selector — it only needs a
+    path to a CSV written by save_recording().
+    """
+    path = Path(path)
+    times, values, sensor_sat, adc_sat = [], [], [], []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            times.append(float(r["time_s"]))
+            values.append(float(r["voltage_v"]))
+            sensor_sat.append(int(r["sensor_sat"]))
+            adc_sat.append(int(r["adc_sat"]))
+
+    win = tk.Toplevel(parent)
+    win.title(f"Recording — {path.name}")
+    fig = Figure(figsize=(9, 5), dpi=100)
+    ax = fig.add_subplot(111)
+    ax.plot(times, values, lw=1.0, color="tab:orange")
+    # Mark saturated samples, if any.
+    sat_t = [t for t, s, a in zip(times, sensor_sat, adc_sat) if s or a]
+    sat_v = [v for v, s, a in zip(values, sensor_sat, adc_sat) if s or a]
+    if sat_t:
+        ax.plot(sat_t, sat_v, ".", color="red", ms=3, label="saturated")
+        ax.legend(loc="upper right", fontsize=8)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Light (V)")
+    ax.set_title(path.stem)
+    ax.grid(True, alpha=0.3)
+
+    canvas = FigureCanvasTkAgg(fig, master=win)
+    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    NavigationToolbar2Tk(canvas, win)
+    canvas.draw()
+    return win
 
 
 class SensorApp:
@@ -305,6 +481,14 @@ class SensorApp:
         self._autogain_btn = ttk.Button(gain, text=autogain_label, command=self._toggle_autogain)
         self._autogain_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
+        # Zero (dark-offset) section
+        zero = section("Zero")
+        self._zero_btn = ttk.Button(zero, text="Zero (dark)", command=self._zero)
+        self._zero_btn.pack(side=tk.TOP, fill=tk.X)
+        ttk.Button(zero, text="Clear zero", command=self._clear_zero).pack(
+            side=tk.TOP, fill=tk.X, pady=(4, 0)
+        )
+
         # Acquisition section
         acq = section("Acquisition")
         interval_row = ttk.Frame(acq)
@@ -317,11 +501,24 @@ class SensorApp:
         ttk.Button(acq, text="Apply interval", command=self._apply_interval).pack(
             side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
+        avg_row = ttk.Frame(acq)
+        avg_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Label(avg_row, text="Avg samples:").pack(side=tk.LEFT)
+        self.average_var = tk.StringVar(value=str(sampler.average))
+        avg_entry = ttk.Entry(avg_row, width=6, textvariable=self.average_var)
+        avg_entry.pack(side=tk.LEFT, padx=(4, 4))
+        avg_entry.bind("<Return>", lambda _e: self._apply_average())
+        ttk.Button(acq, text="Apply averaging", command=self._apply_average).pack(
+            side=tk.TOP, fill=tk.X, pady=(4, 0)
+        )
         self.startstop_btn = ttk.Button(acq, text="Stop", command=self._toggle_run)
         self.startstop_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
         ttk.Button(acq, text="Clear", command=self.sampler.clear).pack(
             side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
+        self._record_btn = ttk.Button(acq, text="● Record", command=self._toggle_record)
+        self._record_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        self._record_started_at = None
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(sidebar, textvariable=self.status_var, wraplength=160).pack(
@@ -391,6 +588,31 @@ class SensorApp:
             self.sampler.resume()
             self.startstop_btn.config(text="Stop")
 
+    def _toggle_record(self):
+        if self.sampler.is_recording:
+            data = self.sampler.stop_recording()
+            self._record_btn.config(text="● Record")
+            times, values, sensor_sat, adc_sat = data
+            if times:
+                path = save_recording(
+                    times,
+                    values,
+                    sensor_sat,
+                    adc_sat,
+                    started_at=self._record_started_at,
+                )
+                open_recording_plot(self.root, path)
+        else:
+            self._record_started_at = datetime.now()
+            self.sampler.start_recording()
+            self._record_btn.config(text="■ Stop recording")
+
+    def _zero(self):
+        self.sampler.start_zero(50)
+
+    def _clear_zero(self):
+        self.sampler.request_clear_zero()
+
     def _apply_gain(self):
         gain_index = GAIN_LABELS.index(self.gain_var.get())
         self.sampler.set_gain(gain_index)  # also disables continuous autogain
@@ -431,6 +653,17 @@ class SensorApp:
             return
         self.sampler.interval_s = ms / 1000.0
 
+    def _apply_average(self):
+        try:
+            n = int(float(self.average_var.get()))
+            if n < 1:
+                raise ValueError
+        except ValueError:
+            self.average_var.set(str(self.sampler.average))
+            return
+        self.sampler.set_average(n)
+        self.average_var.set(str(n))
+
     @staticmethod
     def _rolling_average(times, values, window_s):
         """Trailing moving average: each point is the mean of all samples
@@ -446,16 +679,19 @@ class SensorApp:
         times, values = self.sampler.snapshot()
 
         gain_v = GAIN_VOLTAGES[self.sampler.current_gain]
+        # Saturation is a true-voltage limit; shift it down by the dark offset
+        # so it lines up with the (offset-subtracted) displayed values.
+        sat_v = SATURATION_VOLTAGE - self.sampler.zero_offset
         if self.absscale_var.get():
             # Values already stored as V — use directly.
             unit, vfmt, rfmt = "V", ".4f", ".6f"
-            sat_threshold = SATURATION_VOLTAGE
+            sat_threshold = sat_v
             self.ax.set_ylabel("Light (V)")
         else:
             # Convert stored V back to % relative to current gain.
             values = [v / gain_v * 100 for v in values]
             unit, vfmt, rfmt = "%", ".2f", ".4f"
-            sat_threshold = SATURATION_VOLTAGE / gain_v * 100
+            sat_threshold = sat_v / gain_v * 100
             self.ax.set_ylabel("Light (%)")
 
         self.line.set_data(times, values)
@@ -492,15 +728,30 @@ class SensorApp:
         else:
             self._oneshot_btn.config(state=tk.NORMAL)
 
+        # Show the current dark level on the button (0 when cleared).
+        self._zero_btn.config(text=f"Zero (dark): {self.sampler.zero_offset:.4f} V")
+
+        # Sample-rate / activity indicator.
+        rate = self.sampler.sample_rate
+        if self.sampler.acquiring and rate > 0:
+            rate_str = f"▶ {rate:.0f} sps"
+        elif self.sampler.acquiring:
+            rate_str = "▶ …"  # acquiring but no samples yet / stalled
+        else:
+            rate_str = "❙❙ paused"
+
         sensor_sat = self.sampler.sensor_saturated
         adc_sat = self.sampler.adc_saturated
-        status = self.sampler.status
+        status = f"{rate_str}  {self.sampler.status}"
         if sensor_sat:
-            self.status_var.set(f"⚠ SENSOR SAT  {status}")
+            status = f"⚠ SENSOR SAT  {status}"
         elif adc_sat:
-            self.status_var.set(f"⚠ ADC SAT  {status}")
-        else:
-            self.status_var.set(status)
+            status = f"⚠ ADC SAT  {status}"
+        if self.sampler.zeroing:
+            status = f"zeroing…  {status}"
+        if self.sampler.is_recording:
+            status = f"● REC {self.sampler.recording_count}  {status}"
+        self.status_var.set(status)
 
         if times:
             # Follow the live window only when requested; user pan/zoom turns
