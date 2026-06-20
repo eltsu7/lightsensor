@@ -285,6 +285,47 @@ def daylight_spectrum(temp_k=6500, lo_nm=380, hi_nm=1100, step_nm=5):
     return wls, intensities
 
 
+# CIE 1924 photopic luminous efficiency V(λ), 380–780 nm at 10 nm steps
+# (peak 1.0 near 555 nm). Used to weight a spectrum for photometric units.
+LUMINOUS_EFFICACY_PEAK = 683.0  # lm/W at 555 nm (definition of the candela)
+PHOTOPIC_V = [
+    (380, 0.0000), (390, 0.0001), (400, 0.0004), (410, 0.0012), (420, 0.0040),
+    (430, 0.0116), (440, 0.0230), (450, 0.0380), (460, 0.0600), (470, 0.0910),
+    (480, 0.1390), (490, 0.2080), (500, 0.3230), (510, 0.5030), (520, 0.7100),
+    (530, 0.8620), (540, 0.9540), (550, 0.9950), (560, 0.9950), (570, 0.9520),
+    (580, 0.8700), (590, 0.7570), (600, 0.6310), (610, 0.5030), (620, 0.3810),
+    (630, 0.2650), (640, 0.1750), (650, 0.1070), (660, 0.0610), (670, 0.0320),
+    (680, 0.0170), (690, 0.0082), (700, 0.0041), (710, 0.0021), (720, 0.0010),
+    (730, 0.0005), (740, 0.0003), (750, 0.0001), (760, 0.0001), (770, 0.0000),
+    (780, 0.0000),
+]
+_photopic_cache = None
+
+
+def _photopic_response():
+    """The photopic V(λ) curve wrapped as a Calibration so its trapezoidal
+    source-weighting can be reused. Cached."""
+    global _photopic_cache
+    if _photopic_cache is None:
+        wls = [w for w, _ in PHOTOPIC_V]
+        vs = [v for _, v in PHOTOPIC_V]
+        _photopic_cache = Calibration({}, wls, vs, "")
+    return _photopic_cache
+
+
+def luminous_efficacy(source_wl, source_intensity):
+    """Luminous efficacy K of a source spectrum, in lm/W.
+
+    K = 683 · V̄, where V̄ is the source-weighted mean photopic efficiency
+    (∫ s V dλ / ∫ s dλ). Multiply a radiometric irradiance (W/m²) by K to get
+    illuminance (lux). Returns None if the weighting can't be formed.
+    """
+    v_bar = _photopic_response().source_weighted_responsivity(source_wl, source_intensity)
+    if v_bar is None:
+        return None
+    return LUMINOUS_EFFICACY_PEAK * v_bar
+
+
 @dataclass
 class Reading:
     value: float  # light level, % of ADC full-scale (0–100)

@@ -23,6 +23,7 @@ from lightmeter.sensor import (
     best_gain,
     daylight_spectrum,
     default_calibration,
+    luminous_efficacy,
     GAIN_LABELS,
     GAIN_VOLTAGES,
     DEFAULT_GAIN,
@@ -74,6 +75,9 @@ class SensorSampler:
             _dc.voltage_to_value(1.0, source=self._daylight) if _dc else None
         )
         self._physical_units = _dc.scale_units if _dc else None
+        # Luminous efficacy of the daylight spectrum (lm/W), constant. Multiplying
+        # the radiometric W/m²-per-volt factor by it gives lux per volt.
+        self._daylight_efficacy = luminous_efficacy(*self._daylight)
         self._times = deque(maxlen=MAX_POINTS)
         self._values = deque(maxlen=MAX_POINTS)
         # Recording: unbounded capture independent of the display buffer.
@@ -146,6 +150,13 @@ class SensorSampler:
     @property
     def physical_units(self):
         return self._physical_units
+
+    @property
+    def lux_factor(self):
+        """Lux per volt under the nominal daylight spectrum (None if unknown)."""
+        if self._physical_factor is None or self._daylight_efficacy is None:
+            return None
+        return self._physical_factor * self._daylight_efficacy
 
     def _note_sample(self, t):
         """Record a sample timestamp and trim to the last 0.25 s (call under lock)."""
@@ -451,7 +462,7 @@ class SensorApp:
             unit_row,
             width=6,
             state="readonly",
-            values=["%", "V", "W/m²"],
+            values=["%", "V", "W/m²", "lux"],
             textvariable=self.unit_var,
         ).pack(side=tk.LEFT, padx=(4, 0))
         self.rawpoints_var = tk.BooleanVar(value=False)
@@ -723,11 +734,17 @@ class SensorApp:
         # to V if unavailable).
         mode = self.unit_var.get()
         factor = self.sampler.physical_factor
+        lux_factor = self.sampler.lux_factor
         if mode == "W/m²" and factor:
             values = [v * factor for v in values]
             unit, vfmt, rfmt = "W/m²", ".4f", ".6f"
             sat_threshold = sat_v * factor
             self.ax.set_ylabel(f"Irradiance ({self.sampler.physical_units}, daylight)")
+        elif mode == "lux" and lux_factor:
+            values = [v * lux_factor for v in values]
+            unit, vfmt, rfmt = "lux", ".2f", ".3f"
+            sat_threshold = sat_v * lux_factor
+            self.ax.set_ylabel("Illuminance (lux, daylight)")
         elif mode == "%":
             values = [v / gain_v * 100 for v in values]
             unit, vfmt, rfmt = "%", ".2f", ".4f"

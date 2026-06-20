@@ -116,6 +116,14 @@ sees to ~1100 nm). The GUI's **W/m² units mode** passes this as `source` to wei
 cal that works out to ≈ 0.21 W/m²/V (R̄ ≈ 0.49). It's a nominal estimate — change
 the source, or set a real `scale_factor`, for anything better.
 
+**Photometric / lux (`luminous_efficacy(wl, intensity)`):** returns the source's
+luminous efficacy `K = 683 · V̄` (lm/W), where `V̄` is the spectrum weighted by the
+CIE photopic `V(λ)` (`PHOTOPIC_V`, 380–780 nm). Illuminance (lux) = `K ·`
+irradiance, so the GUI's **lux units mode** = W/m² factor × `K(daylight)` ≈
+0.21 × 144 ≈ 30 lux/V. Lux (illuminance, lm/m²) is the honest unit for a flat
+detector; luminance (cd/m²) would need a solid-angle / diffuse-field assumption and
+isn't exposed.
+
 **Conversion model:** `physical = scale_factor · V / R̄_source`. The sensor
 integrates incident light over its spectral response, so the same voltage means
 different physical levels for different spectra — passing `source=(wavelengths,

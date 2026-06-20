@@ -5,7 +5,12 @@ Pure functions only — no hardware required. Run with: uv run tests/test_calibr
 
 import os
 
-from lightmeter.sensor import daylight_spectrum, default_calibration, parse_calibration
+from lightmeter.sensor import (
+    daylight_spectrum,
+    default_calibration,
+    luminous_efficacy,
+    parse_calibration,
+)
 
 # Repo root, so the dummy data path is independent of the caller's cwd.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,6 +151,30 @@ def test_default_daylight_conversion():
     factor = cal.voltage_to_value(1.0, source=day)
     assert factor > cal.scale_factor
     assert approx(factor, cal.scale_factor / r_bar, tol=1e-9)
+
+
+def test_luminous_efficacy():
+    # A monochromatic source near the photopic peak -> close to 683 lm/W
+    # (the 10 nm table tops out at V=0.995 around 550–560 nm).
+    peak = ([554, 555, 556], [1.0, 1.0, 1.0])
+    assert 675 < luminous_efficacy(*peak) <= 683
+    # Pure near-IR (outside the photopic band) carries no luminous flux.
+    ir = ([1000, 1010, 1020], [1.0, 1.0, 1.0])
+    assert luminous_efficacy(*ir) == 0.0
+    # Daylight: broadband incl. IR -> efficacy well below the 683 peak.
+    k = luminous_efficacy(*daylight_spectrum())
+    assert 80 < k < 250
+
+
+def test_lux_factor_from_default():
+    # The GUI's volts→lux path: radiometric factor × daylight luminous efficacy.
+    cal = default_calibration()
+    day = daylight_spectrum()
+    phys = cal.voltage_to_value(1.0, source=day)  # W/m² per V
+    lux = phys * luminous_efficacy(*day)  # lux per V
+    assert lux > 0
+    # Low-light 2 MΩ front end: full-scale (~3.27 V) is a modest indoor level.
+    assert 20 < lux * 3.266 < 400
 
 
 def run():
