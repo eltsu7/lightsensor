@@ -5,7 +5,7 @@ Pure functions only — no hardware required. Run with: uv run tests/test_calibr
 
 import os
 
-from lightmeter.sensor import parse_calibration
+from lightmeter.sensor import daylight_spectrum, default_calibration, parse_calibration
 
 # Repo root, so the dummy data path is independent of the caller's cwd.
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +98,54 @@ def test_dummy_csv_loads():
     assert len(cal.wavelengths) == 400
     assert cal.scale_factor == 1.0
     assert cal.metadata.get("device_id") == "dummy-0001"
+
+
+def test_provenance_defaults_to_measured():
+    # A cal without an explicit provenance is assumed real.
+    cal = make_cal()
+    assert cal.provenance == "measured"
+    assert cal.is_nominal is False
+
+
+def test_bundled_default_calibration():
+    # The packaged BPW34 fallback: real spectral shape, flagged nominal, with a
+    # datasheet-derived (not measured) absolute scale for R_f = 2 MΩ.
+    cal = default_calibration()
+    assert cal is not None
+    assert cal.provenance == "datasheet-typical"
+    assert cal.is_nominal is True
+    assert cal.scale_units == "W/m^2"
+    # Nominal scale: 1/(R_peak*A*R_f) with R_peak≈0.646 A/W, A=7.5e-6 m², R_f=2e6 Ω.
+    assert approx(cal.scale_factor, 0.103, tol=0.005)
+    # source=None ⇒ assume the 900 nm peak ⇒ physical = scale_factor * V.
+    assert approx(cal.voltage_to_value(2.0), 2 * cal.scale_factor, tol=1e-9)
+    # Peak near 900 nm, falls off to the 10% points at the band edges.
+    assert approx(cal.responsivity_at(900), 1.0, tol=1e-6)
+    assert cal.responsivity_at(660) > cal.responsivity_at(450)
+    assert cal.responsivity_at(1200) == 0.0
+
+
+def test_daylight_spectrum_shape():
+    wl, inten = daylight_spectrum()
+    # Spans the BPW34 band, ascending, all positive.
+    assert wl[0] == 380 and wl[-1] == 1100
+    assert all(b > 0 for b in inten)
+    assert wl == sorted(wl)
+    # 6500 K blackbody peaks in the visible (~450 nm), not the IR.
+    assert wl[inten.index(max(inten))] < 600
+
+
+def test_default_daylight_conversion():
+    # The GUI's volts→W/m² path: default cal weighted by daylight. Daylight is
+    # blue-heavy where BPW34 is weak, so R̄ < 1 and the factor exceeds the
+    # peak-monochromatic scale_factor.
+    cal = default_calibration()
+    day = daylight_spectrum()
+    r_bar = cal.source_weighted_responsivity(*day)
+    assert 0.3 < r_bar < 0.7
+    factor = cal.voltage_to_value(1.0, source=day)
+    assert factor > cal.scale_factor
+    assert approx(factor, cal.scale_factor / r_bar, tol=1e-9)
 
 
 def run():

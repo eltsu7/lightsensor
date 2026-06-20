@@ -6,6 +6,8 @@ from lightmeter.sensor import (
     LightSensor,
     Reading,
     best_gain,
+    daylight_spectrum,
+    default_calibration,
     parse_calibration,
 )
 from lightmeter.port_detect import autodetect_port
@@ -16,6 +18,8 @@ __all__ = [
     "LightSensor",
     "Reading",
     "best_gain",
+    "daylight_spectrum",
+    "default_calibration",
     "parse_calibration",
     "autodetect_port",
 ]

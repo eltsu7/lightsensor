@@ -21,6 +21,8 @@ from lightmeter.sensor import (
     LightSensor,
     autodetect_port,
     best_gain,
+    daylight_spectrum,
+    default_calibration,
     GAIN_LABELS,
     GAIN_VOLTAGES,
     DEFAULT_GAIN,
@@ -63,6 +65,15 @@ class SensorSampler:
         self._zero_offset_v = 0.0
         self._rate_window = deque()  # recent sample times for sps calc
         self._average = 1  # firmware-side samples averaged per read
+        # Physical-units conversion (volts -> W/m²) under a nominal daylight
+        # spectrum. Seeded from the bundled default cal so it works before a
+        # device connects; refreshed from the device's own cal on connect.
+        self._daylight = daylight_spectrum()
+        _dc = default_calibration()
+        self._physical_factor = (
+            _dc.voltage_to_value(1.0, source=self._daylight) if _dc else None
+        )
+        self._physical_units = _dc.scale_units if _dc else None
         self._times = deque(maxlen=MAX_POINTS)
         self._values = deque(maxlen=MAX_POINTS)
         # Recording: unbounded capture independent of the display buffer.
@@ -126,6 +137,15 @@ class SensorSampler:
     @property
     def average(self):
         return self._average
+
+    @property
+    def physical_factor(self):
+        """W/m² per volt under the nominal daylight spectrum (None if unknown)."""
+        return self._physical_factor
+
+    @property
+    def physical_units(self):
+        return self._physical_units
 
     def _note_sample(self, t):
         """Record a sample timestamp and trim to the last 0.25 s (call under lock)."""
@@ -217,6 +237,14 @@ class SensorSampler:
                     self.status = "connecting..."
                     sensor = LightSensor(self.port, self.baud)
                     self._applied_gain = None  # reapply gain on fresh connection
+                    # Prefer the device's own calibration for unit conversion;
+                    # falls back to the bundled default when it has none.
+                    cal = sensor.load_calibration()
+                    if cal is not None:
+                        f = cal.voltage_to_value(1.0, source=self._daylight)
+                        if f is not None:
+                            self._physical_factor = f
+                            self._physical_units = cal.scale_units
                     self.status = "connected"
 
                 sensor.average = self._average
@@ -411,12 +439,21 @@ class SensorApp:
             text="Auto Y-scale",
             variable=self.autoscale_var,
         ).pack(side=tk.TOP, anchor=tk.W)
-        self.absscale_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            view,
-            text="Absolute scale",
-            variable=self.absscale_var,
-        ).pack(side=tk.TOP, anchor=tk.W)
+        unit_row = ttk.Frame(view)
+        unit_row.pack(side=tk.TOP, fill=tk.X, anchor=tk.W)
+        ttk.Label(unit_row, text="Units:").pack(side=tk.LEFT)
+        # W/m² is a nominal irradiance under an assumed daylight spectrum (see
+        # the sampler's physical_factor); default to it when available.
+        self.unit_var = tk.StringVar(
+            value="W/m²" if sampler.physical_factor else "V"
+        )
+        ttk.Combobox(
+            unit_row,
+            width=6,
+            state="readonly",
+            values=["%", "V", "W/m²"],
+            textvariable=self.unit_var,
+        ).pack(side=tk.LEFT, padx=(4, 0))
         self.rawpoints_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             view,
@@ -681,17 +718,26 @@ class SensorApp:
         # Saturation is a true-voltage limit; shift it down by the dark offset
         # so it lines up with the (offset-subtracted) displayed values.
         sat_v = SATURATION_VOLTAGE - self.sampler.zero_offset
-        if self.absscale_var.get():
-            # Values already stored as V — use directly.
-            unit, vfmt, rfmt = "V", ".4f", ".6f"
-            sat_threshold = sat_v
-            self.ax.set_ylabel("Light (V)")
-        else:
-            # Convert stored V back to % relative to current gain.
+        # Values are stored as true volts (gain-independent); convert per the
+        # selected display unit. W/m² requires the physical factor (falls back
+        # to V if unavailable).
+        mode = self.unit_var.get()
+        factor = self.sampler.physical_factor
+        if mode == "W/m²" and factor:
+            values = [v * factor for v in values]
+            unit, vfmt, rfmt = "W/m²", ".4f", ".6f"
+            sat_threshold = sat_v * factor
+            self.ax.set_ylabel(f"Irradiance ({self.sampler.physical_units}, daylight)")
+        elif mode == "%":
             values = [v / gain_v * 100 for v in values]
             unit, vfmt, rfmt = "%", ".2f", ".4f"
             sat_threshold = sat_v / gain_v * 100
             self.ax.set_ylabel("Light (%)")
+        else:
+            # Values already stored as V — use directly.
+            unit, vfmt, rfmt = "V", ".4f", ".6f"
+            sat_threshold = sat_v
+            self.ax.set_ylabel("Light (V)")
 
         self.line.set_data(times, values)
         self.line.set_visible(self.rawpoints_var.get())

@@ -90,9 +90,31 @@ all unit math is host-side.
 | Member | Description |
 |--------|-------------|
 | `scale_factor` / `scale_units` | Absolute scale (physical_unit per volt) and its unit string |
+| `provenance` / `is_nominal` | `'measured'` (real cal, default) vs `'datasheet-typical'` (bundled fallback, shape only) |
 | `responsivity_at(wl)` | `R(λ)` by linear interpolation; `0` outside the measured band |
 | `source_weighted_responsivity(wl, intensity)` | `R̄ = ∫sR dλ / ∫s dλ` for a source (trapezoidal) |
 | `voltage_to_value(voltage, source=None)` | Convert a dark-corrected voltage to a physical value |
+
+**Bundled default (`default_calibration()`):** when the device has no stored cal,
+`load_calibration()` falls back to the packaged BPW34 datasheet-typical curve
+(`lightmeter/data/calibration_bpw34_typical.csv`, from Vishay doc 81521 Fig. 7).
+It carries the real *spectral shape* `R(λ)` (peak 900 nm, 10% points 430/1100 nm)
+plus a **nominal** absolute scale `scale_factor ≈ 0.103 W/m²/V`, derived purely from
+the datasheet — `1/(R_peak·A·R_f)` with `R_peak ≈ 0.646 A/W` (from `I_k = 47 µA @
+1 mW/cm², 950 nm`, renormalized to the peak), `A = 7.5 mm²`, and the board's
+`R_f = 2 MΩ`. Good to ~datasheet tolerance (±20%), not a measured cal — flagged
+`provenance='datasheet-typical'` (`is_nominal=True`) so callers never mistake it for
+one. `source=None` assumes monochromatic light at the 900 nm peak. Re-derive
+`scale_factor` if `R_f` changes; replace the whole file with a measured cal when
+available. Pass `load_calibration(use_default=False)` to opt out of the fallback.
+
+**Daylight weighting (`daylight_spectrum(temp_k=6500, …)`):** returns
+`(wavelengths_nm, relative_intensities)` for a Planck blackbody across the BPW34
+band (a blackbody, not the D65 table, because D65 stops at 830 nm while the sensor
+sees to ~1100 nm). The GUI's **W/m² units mode** passes this as `source` to weight
+`R(λ)`, so the displayed irradiance assumes a daylight spectrum; with the default
+cal that works out to ≈ 0.21 W/m²/V (R̄ ≈ 0.49). It's a nominal estimate — change
+the source, or set a real `scale_factor`, for anything better.
 
 **Conversion model:** `physical = scale_factor · V / R̄_source`. The sensor
 integrates incident light over its spectral response, so the same voltage means

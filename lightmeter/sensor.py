@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import binascii
 import logging
+import math
 import threading
 import serial
 import time
@@ -116,6 +117,20 @@ class Calibration:
         """Unit string the scale_factor maps to, e.g. 'W/m^2' (None if unset)."""
         return self.metadata.get("scale_units")
 
+    @property
+    def provenance(self):
+        """Where this calibration came from: 'measured' (a real reference/
+        monochromator run) or 'datasheet-typical' (the bundled nominal fallback,
+        spectral shape only). Defaults to 'measured' when unspecified, since a
+        cal stored on the device is assumed real."""
+        return self.metadata.get("provenance", "measured")
+
+    @property
+    def is_nominal(self):
+        """True for the datasheet-typical fallback — readings are order-of-
+        magnitude only and carry no part-specific absolute scale."""
+        return self.provenance == "datasheet-typical"
+
     def responsivity_at(self, wl):
         """Relative responsivity R(λ) at one wavelength by linear interpolation.
 
@@ -220,6 +235,54 @@ def parse_calibration(text):
             except ValueError:
                 pass
     return Calibration(metadata, wavelengths, responsivity, text)
+
+
+_default_calibration_cache = None
+
+
+def default_calibration():
+    """The bundled BPW34 datasheet-typical calibration (spectral shape only).
+
+    A nominal fallback used when the device has no stored calibration: it carries
+    the real R(λ) shape from the Vishay BPW34 datasheet but no absolute
+    scale_factor (that needs the PCB transimpedance resistor and a reference
+    measurement). provenance == 'datasheet-typical'; see is_nominal. Cached after
+    first load. Returns None if the bundled file is missing.
+    """
+    global _default_calibration_cache
+    if _default_calibration_cache is None:
+        try:
+            from importlib.resources import files
+
+            text = (files("lightmeter") / "data" / "calibration_bpw34_typical.csv").read_text()
+            _default_calibration_cache = parse_calibration(text)
+        except (FileNotFoundError, ModuleNotFoundError, OSError):
+            return None
+    return _default_calibration_cache
+
+
+def daylight_spectrum(temp_k=6500, lo_nm=380, hi_nm=1100, step_nm=5):
+    """A nominal daylight spectrum as (wavelengths_nm, relative_intensities).
+
+    A Planck blackbody at temp_k (default 6500 K ≈ CIE D65 correlated colour
+    temperature) sampled across the band. Only the *shape* matters for source
+    weighting (R̄ = ∫sR/∫s normalises out absolute scale), so this is returned
+    unnormalised. A blackbody is used rather than the tabulated D65 illuminant
+    because D65 stops at 830 nm, whereas this sensor (BPW34) responds out to
+    ~1100 nm — truncating there would drop the near-IR the silicon sees. This is
+    an approximation for an out-of-the-box estimate, not a metrological source.
+    """
+    c2 = 1.438776877e-2  # second radiation constant hc/k_B, m·K
+    wls, intensities = [], []
+    wl = lo_nm
+    while wl <= hi_nm:
+        lam = wl * 1e-9  # m
+        # Planck spectral radiance per wavelength, relative (constants dropped).
+        b = 1.0 / (lam**5 * (math.exp(c2 / (lam * temp_k)) - 1.0))
+        wls.append(wl)
+        intensities.append(b)
+        wl += step_nm
+    return wls, intensities
 
 
 @dataclass
@@ -633,13 +696,21 @@ class LightSensor:
             return None
         return parse_calibration(data.decode(errors="ignore"))
 
-    def load_calibration(self):
+    def load_calibration(self, use_default=True):
         """Read the device calibration and cache it in self.calibration.
 
-        Returns the Calibration (or None if the device has none). read_physical()
-        calls this on first use; call it explicitly to refresh after a write.
+        Returns the Calibration. read_physical() calls this on first use; call it
+        explicitly to refresh after a write. When the device has no stored cal and
+        use_default is True, falls back to the bundled BPW34 datasheet-typical
+        calibration (provenance 'datasheet-typical', see Calibration.is_nominal) so
+        readings have a real spectral shape out of the box — note it has no absolute
+        scale_factor, so read_physical() still returns None until one is set. Pass
+        use_default=False to get None when the device is uncalibrated.
         """
-        self.calibration = self.read_calibration()
+        cal = self.read_calibration()
+        if cal is None and use_default:
+            cal = default_calibration()
+        self.calibration = cal
         return self.calibration
 
     def clear_calibration(self):
