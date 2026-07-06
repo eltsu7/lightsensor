@@ -7,8 +7,8 @@
 
 // Protocol/firmware identity. Bump PROTO_VERSION on any breaking change to the
 // serial command set or response formats; bump FW_VERSION for any release.
-#define PROTO_VERSION 1
-#define FW_VERSION "1.0.0"
+#define PROTO_VERSION 2
+#define FW_VERSION "2.0.0"
 
 // Error codes returned as "err <code>" by command-style responses. 0 is never
 // emitted (success uses "ok"). Keep in sync with lightsensor.py ERR_*.
@@ -44,9 +44,9 @@ uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
   return crc;
 }
 
-// ESP32-C3 SuperMini I2C pins (v2 PCB).
-const int I2C_SDA = 10;
-const int I2C_SCL = 21;
+// ESP32-C3 SuperMini I2C pins (v3 wiring: SDA/SCL next to 3V3/GND).
+const int I2C_SDA = 4;
+const int I2C_SCL = 3;
 
 Adafruit_ADS1115 ads;
 
@@ -63,6 +63,13 @@ adsGain_t gains[] = {
 };
 float gainVoltages[] = {6.144, 4.096, 2.048, 1.024, 0.512, 0.256};
 int currentGain = 1;
+// Autogain (autoexposure) mode. When on, `r` reads step the gain until the
+// signal is in-band, then average. Any manual `g<n>` turns it off.
+bool autoGain = false;
+// Autoexposure band on % of full scale: wider than the 2x adjacent-gain
+// ratio, so a single step always lands in-band (no oscillation).
+const float AUTOGAIN_LOW_PCT = 40.0;
+const float AUTOGAIN_HIGH_PCT = 90.0;
 
 void setup() {
   Serial.setRxBufferSize(8192);  // headroom for bulk calibration uploads
@@ -75,8 +82,44 @@ void setup() {
   ads.setDataRate(RATE_ADS1115_860SPS);
 }
 
-// Read 'count' samples, average the raw values, and emit one line.
+// True if a raw sample overflows the ADC counter at the current gain.
+bool isAdcSat(int16_t raw) {
+  return raw >= 32767;
+}
+
+// True if the op-amp output is near the supply rail. Only possible when the
+// gain full-scale exceeds SENSOR_SAT_V; otherwise the ADC overflows first.
+bool isSensorSat(int16_t raw) {
+  if (gainVoltages[currentGain] <= SENSOR_SAT_V) return false;
+  int16_t thr = (int16_t)(SENSOR_SAT_V / gainVoltages[currentGain] * 32767);
+  return raw >= thr;
+}
+
+// Step the gain (single samples) until the signal is in-band or a gain rail
+// (0 = widest, ngains-1 = most sensitive) is reached. Bounded by ngains.
+void autoExpose() {
+  int ngains = (int)(sizeof(gainVoltages) / sizeof(gainVoltages[0]));
+  for (int iter = 0; iter < ngains; iter++) {
+    int16_t raw = ads.readADC_SingleEnded(0);
+    float pct = (float)raw / 32767.0 * 100.0;
+    bool over = isSensorSat(raw) || isAdcSat(raw) || pct >= AUTOGAIN_HIGH_PCT;
+    bool under = pct < AUTOGAIN_LOW_PCT;
+    if (over && currentGain > 0) {
+      currentGain--;  // wider range, less sensitive
+      ads.setGain(gains[currentGain]);
+    } else if (under && currentGain < ngains - 1) {
+      currentGain++;  // narrower range, more sensitive
+      ads.setGain(gains[currentGain]);
+    } else {
+      break;  // in-band, or railed
+    }
+  }
+}
+
+// Read 'count' samples (after autoexposing if enabled), average the raw
+// values, and emit one line: "raw,sensor_sat,adc_sat,gain".
 void sendReading(int count) {
+  if (autoGain) autoExpose();
   if (count < 1) count = 1;
   long sum = 0;
   for (int i = 0; i < count; i++) {
@@ -84,23 +127,13 @@ void sendReading(int count) {
   }
   int16_t raw = (int16_t)(sum / count);
 
-  // ADC saturation: raw hit the top of the signed 16-bit range.
-  bool adcSat = (raw >= 32767);
-
-  // Sensor saturation: op-amp output near the supply rail. Only possible when
-  // the gain full-scale exceeds SENSOR_SAT_V; otherwise the ADC overflows
-  // before the sensor can saturate.
-  bool sensorSat = false;
-  if (gainVoltages[currentGain] > SENSOR_SAT_V) {
-    int16_t satThreshold = (int16_t)(SENSOR_SAT_V / gainVoltages[currentGain] * 32767);
-    sensorSat = (raw >= satThreshold);
-  }
-
   Serial.print(raw);
   Serial.print(",");
-  Serial.print(sensorSat ? 1 : 0);
+  Serial.print(isSensorSat(raw) ? 1 : 0);
   Serial.print(",");
-  Serial.println(adcSat ? 1 : 0);
+  Serial.print(isAdcSat(raw) ? 1 : 0);
+  Serial.print(",");
+  Serial.println(currentGain);
 }
 
 // After an 'r', read an optional decimal sample count terminated by a
@@ -253,12 +286,31 @@ void loop() {
       if (g >= 0 && g <= 5) {
         currentGain = g;
         ads.setGain(gains[currentGain]);
+        autoGain = false;  // manual gain turns autoexposure off
         Serial.println("ok");
       } else {
         sendErr(ERR_BAD_ARG);
       }
 
     } else if (cmd == 'G') {
+      Serial.println(currentGain);
+
+    } else if (cmd == 'a') {
+      while (!Serial.available());
+      char c = Serial.read();  // a1 = enable, a0 = disable
+      if (c == '1') {
+        autoGain = true;
+        Serial.println("ok");
+      } else if (c == '0') {
+        autoGain = false;
+        Serial.println("ok");
+      } else {
+        sendErr(ERR_BAD_ARG);
+      }
+
+    } else if (cmd == 'A') {
+      Serial.print(autoGain ? 1 : 0);  // autogain status + current gain
+      Serial.print(" ");
       Serial.println(currentGain);
 
     } else if (cmd == 'W') {

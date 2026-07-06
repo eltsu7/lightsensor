@@ -1,6 +1,6 @@
 [project]
 name = "lightmeter"
-version = "0.1.0"
+version = "2.0.0"
 description = "Driver and debug GUI for a calibrated ESP32-C3 light sensor (OPA323 + ADS1115)."
 readme = "README.md"
 requires-python = ">=3.13"

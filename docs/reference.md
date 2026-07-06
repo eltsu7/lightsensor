@@ -6,18 +6,30 @@ Python API is also documented in docstrings in `lightmeter/sensor.py`.
 
 ## Serial protocol
 
-Single-char commands at 115200 baud (`raw` = signed 16-bit 0–32767; flags 0/1):
+Single-char commands at 115200 baud (`raw` = signed 16-bit 0–32767; flags 0/1).
+**Protocol version 2.**
 
 | Command | Description | Response |
 |---------|-------------|----------|
-| `r` / `r<n>\n` | Read once / averaging `n` samples (clamped 1–1000) | `raw,sensor_sat,adc_sat\n` |
-| `g<n>` | Set gain index 0–5 | `ok` / `err <code>` |
+| `r` / `r<n>\n` | Read once / averaging `n` samples (clamped 1–1000); autoexposes first if autogain is on | `raw,sensor_sat,adc_sat,gain\n` |
+| `g<n>` | Set gain index 0–5 (turns autogain **off**) | `ok` / `err <code>` |
 | `G` | Query gain index | integer |
+| `a0` / `a1` | Disable / enable autogain (autoexposure) | `ok` / `err <code>` |
+| `A` | Query autogain state + current gain | `<0\|1> <gain>` |
 | `p` | Ping (no I2C) | `pong` |
-| `I` | Identity / version handshake | `lightsensor proto=1 fw=… id=<MAC> sps=860 vsat=3.20 gains=6.144,…` |
+| `I` | Identity / version handshake | `lightsensor proto=2 fw=… id=<MAC> sps=860 vsat=3.20 gains=6.144,…` |
 | `W<n>\n`+bytes | Write calibration blob | `ok <crc32>` / `err <code>` |
 | `C` | Read calibration | `<size> <crc32>\n` + bytes (`0 0` if none) |
 | `H` / `X` | Cal size / erase | size / `ok` / `err <code>` |
+
+**Autogain (autoexposure)** lives in the firmware. When on, each `r` read takes
+a sample and, while over-exposed (saturated or ≥90 % of full scale) or
+under-exposed (<40 %), steps the gain one notch (wider range / more sensitive)
+and re-reads, until the signal is in-band or a gain rail (0 or 5) is hit; then it
+averages `n` at the settled gain. The `r` reply's 4th field is that gain — the
+host records it (raw is gain-relative). Any manual `g<n>` turns autogain off.
+The 40 %/90 % band is wider than the 2× adjacent-gain ratio, so one step always
+lands in-band (no oscillation).
 
 **Gain index → range / saturation:** 0 ±6.144 V, 1 ±4.096 V (default), 2 ±2.048 V,
 3 ±1.024 V, 4 ±0.512 V, 5 ±0.256 V. Indices 0–1 saturate at the sensor (3.266 V);
@@ -63,9 +75,8 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | Member | Description |
 |--------|-------------|
 | `read()` | Returns `Reading` or `None` |
-| `gain` / `set_gain(i)` / `get_gain()` | Applied gain index (tracked locally) / set / query device |
-| `autogain` / `autogain_interval` / `autogain_window` | Continuous autogain inside `read()` and its timing |
-| `autogain_oneshot(n=100)` | Collect n samples, apply best gain, return index |
+| `gain` / `set_gain(i)` / `get_gain()` | Applied gain index (tracked locally, from the device's `r` reply) / set (also disables autogain on the device) / query device |
+| `autogain` / `set_autogain(enabled)` / `get_autogain()` | Local mirror of firmware autoexposure state / enable-disable (`a1`/`a0`) / query device state + gain (`A`) |
 | `zero(n=50)` / `clear_zero()` / `is_zeroed` / `zero_offset` | Dark-offset (volts) measure / clear / state |
 | `average` | ADC samples the firmware averages per `read()` (default 1; ~√n noise, ×n time) |
 | `info` / `ping()` / `identify()` / `connected` | Identity from handshake / link check / query / port state |
@@ -79,7 +90,19 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 Behavioral contracts (thread-safety, reconnect, dark-offset ordering) are in
 CLAUDE.md's invariants; the dark offset is stored as volts so it stays correct
 across gain changes, and `read()` subtracts it last (display only) — `sensor_sat`
-/ `adc_sat` still reflect the true raw level.
+/ `adc_sat` still reflect the true raw level. Autoexposure itself is firmware-side
+(see the protocol table above); the driver only mirrors the resulting gain.
+
+## Rust driver (`rust/`)
+
+A from-scratch Rust port of this driver (`lightmeter` crate, MIT/Apache-2.0),
+built for the [pointcamera](https://github.com/eltsu7/pointcamera) turret rig.
+Same protocol, same semantics (gain/autogain/zero/reconnect), behind a
+`Transport` trait so a `SimTransport` can emulate the firmware line-by-line for
+hardware-free tests and GUI development. Calibration transfer and the
+spectral/photometric conversion pipeline are intentionally not ported yet —
+raw values and volts are what a consumer needs today; see the crate's own
+rustdoc (`cargo doc --open` in `rust/`) for the full API.
 
 ## Calibration & physical units (`Calibration`)
 

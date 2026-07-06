@@ -4,8 +4,10 @@ Pure functions only — no hardware required. Run with: uv run tests/test_calibr
 """
 
 import os
+import tomllib
 
 from lightmeter.sensor import (
+    PROTO_VERSION,
     daylight_spectrum,
     default_calibration,
     luminous_efficacy,
@@ -175,6 +177,21 @@ def test_lux_factor_from_default():
     assert lux > 0
     # Low-light 2 MΩ front end: full-scale (~3.27 V) is a modest indoor level.
     assert 20 < lux * 3.266 < 400
+
+
+def test_package_major_matches_protocol():
+    """The package's semver MAJOR is pinned to the wire protocol version it
+    speaks (same contract as the Rust crate, see rust/tests/sensor.rs):
+    `lightmeter==2.*` promises proto-2 compatibility. A PROTO_VERSION bump
+    without a matching pyproject.toml major bump (or vice versa) breaks that
+    promise silently -- catch it here instead."""
+    with open(os.path.join(ROOT, "pyproject.toml"), "rb") as f:
+        pkg_version = tomllib.load(f)["project"]["version"]
+    major = int(pkg_version.split(".")[0])
+    assert major == PROTO_VERSION, (
+        f"pyproject.toml major version ({major}) must equal PROTO_VERSION "
+        f"({PROTO_VERSION}) -- bump both together"
+    )
 
 
 def run():

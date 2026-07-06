@@ -56,9 +56,8 @@ class SensorSampler:
         self._skip_next = False  # discard one sample after a gain change
         self._sensor_sat = False
         self._adc_sat = False
-        self._autogain_continuous = True
-        self._oneshot_n = 0
-        self._oneshot_collected = 0
+        self._autogain_continuous = True   # desired autoexposure state
+        self._autogain_applied = None      # device state; None forces (re)apply
         self._zero_request = 0  # n samples to zero over (0 = no request)
         self._clear_zero_req = False
         self._zeroing = False
@@ -114,12 +113,6 @@ class SensorSampler:
         self._autogain_continuous = False
         self._desired_gain = gain_index
         self._skip_next = True
-
-    def start_oneshot_autogain(self, n=100):
-        """Trigger a one-shot autogain measurement in the sampler thread."""
-        self.clear()
-        self._oneshot_collected = 0
-        self._oneshot_n = n
 
     def enable_autogain(self):
         self._autogain_continuous = True
@@ -190,13 +183,6 @@ class SensorSampler:
     @property
     def autogain_continuous(self):
         return self._autogain_continuous
-
-    @property
-    def oneshot_progress(self):
-        """(collected, target) while active, else None."""
-        if self._oneshot_n == 0:
-            return None
-        return (self._oneshot_collected, self._oneshot_n)
 
     def clear(self):
         with self._lock:
@@ -276,15 +262,26 @@ class SensorSampler:
                         self._zeroing = False
                     self._skip_next = True
                     continue
-                if self._desired_gain != self._applied_gain:
+                # Manual gain (only when autogain is off; a manual gain also
+                # turns autoexposure off on the device).
+                if not self._autogain_continuous and self._desired_gain != self._applied_gain:
                     if sensor.set_gain(self._desired_gain):
                         self._applied_gain = self._desired_gain
-                sensor.autogain = self._autogain_continuous
+                        self._autogain_applied = False
+                        self._skip_next = True
+                    continue
+                # Autogain mode change (firmware-side autoexposure).
+                if self._autogain_continuous != self._autogain_applied:
+                    if sensor.set_autogain(self._autogain_continuous):
+                        self._autogain_applied = self._autogain_continuous
+                        self._skip_next = True
+                    continue
                 reading = sensor.read()
                 if self._skip_next:
                     self._skip_next = False
                     continue
-                # Detect gain change driven by autogain inside read().
+                # The device may have stepped gain (autoexposure); sensor.gain
+                # reflects it after read().
                 if sensor.gain != self._applied_gain:
                     self._applied_gain = sensor.gain
                     self._desired_gain = sensor.gain
@@ -298,20 +295,6 @@ class SensorSampler:
                     last_value = value
                     self._sensor_sat = reading.sensor_sat
                     self._adc_sat = reading.adc_sat
-                    # One-shot autogain: count samples, evaluate when target reached.
-                    if self._oneshot_n > 0:
-                        self._oneshot_collected += 1
-                        if self._oneshot_collected >= self._oneshot_n:
-                            with self._lock:
-                                vs = list(self._values)
-                            vs.append(value)
-                            new_gain = best_gain(max(vs))  # vs already in V
-                            self._oneshot_n = 0
-                            if new_gain != self._applied_gain:
-                                sensor.set_gain(new_gain)
-                                self._desired_gain = new_gain
-                                self._applied_gain = new_gain
-                                self._skip_next = True
             except (serial.SerialException, OSError) as exc:
                 # Transient link error: drop the connection and retry.
                 self.status = f"reconnecting ({exc.__class__.__name__})"
@@ -522,8 +505,6 @@ class SensorApp:
         gain_combo.pack(side=tk.LEFT, padx=2)
         gain_combo.bind("<<ComboboxSelected>>", lambda _e: self._apply_gain())
         ttk.Button(gain_row, text="+", width=2, command=self._gain_up).pack(side=tk.LEFT)
-        self._oneshot_btn = ttk.Button(gain, text="One-shot gain", command=self._oneshot_autogain)
-        self._oneshot_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
         autogain_label = "Auto gain ●" if sampler.autogain_continuous else "Auto gain"
         self._autogain_btn = ttk.Button(gain, text=autogain_label, command=self._toggle_autogain)
         self._autogain_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
@@ -677,10 +658,6 @@ class SensorApp:
             self.gain_var.set(GAIN_LABELS[idx - 1])
             self._apply_gain()  # scale changed; old samples no longer comparable
 
-    def _oneshot_autogain(self):
-        self._oneshot_btn.config(state=tk.DISABLED)
-        self.sampler.start_oneshot_autogain(100)
-
     def _toggle_autogain(self):
         if self.sampler.autogain_continuous:
             self.sampler.disable_autogain()
@@ -780,15 +757,6 @@ class SensorApp:
         current_label = GAIN_LABELS[self.sampler.current_gain]
         if self.gain_var.get() != current_label:
             self.gain_var.set(current_label)
-
-        # One-shot progress / completion.
-        progress = self.sampler.oneshot_progress
-        if progress is not None:
-            collected, target = progress
-            self.status_var.set(f"Auto-gain: {collected}/{target}")
-            return
-        else:
-            self._oneshot_btn.config(state=tk.NORMAL)
 
         # Show the current dark level on the button (0 when cleared).
         self._zero_btn.config(text=f"Zero (dark): {self.sampler.zero_offset:.4f} V")
