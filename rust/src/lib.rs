@@ -1,6 +1,6 @@
 //! Rust driver for the ESP32-C3 + OPA323 + ADS1115 light sensor.
 //!
-//! Speaks serial protocol v1 (see `../docs/reference.md`, the contract shared
+//! Speaks serial protocol v2 (see `../docs/reference.md`, the contract shared
 //! with `firmware/lightsensor` and the Python driver). Calibration transfer
 //! and spectral/photometric conversion are intentionally not ported yet —
 //! they live behind placeholder numbers on the Python side too.

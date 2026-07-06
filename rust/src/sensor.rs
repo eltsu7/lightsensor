@@ -1,6 +1,6 @@
 //! The driver: gain model, identity handshake, readings, autogain, zeroing.
 //!
-//! A faithful port of `lightmeter/sensor.py` (protocol v1, see
+//! A faithful port of `lightmeter/sensor.py` (protocol v2, see
 //! `docs/reference.md`). Deliberately NOT ported yet: calibration transfer
 //! (`W`/`C`/`H`/`X`) and the spectral/photometric conversion — raw values and
 //! volts are what the point camera stores; physical units land once the
@@ -61,7 +61,7 @@ pub struct DeviceInfo {
     pub fields: HashMap<String, String>,
 }
 
-/// Parse an identity line (`lightsensor proto=1 fw=… id=… …`), or `None`
+/// Parse an identity line (`lightsensor proto=2 fw=… id=… …`), or `None`
 /// if the line doesn't look like one.
 pub fn parse_identity(line: &str) -> Option<DeviceInfo> {
     let mut parts = line.split_whitespace();

@@ -2,7 +2,7 @@
 name = "lightmeter"
 version = "0.1.0"
 edition = "2024"
-description = "Rust driver for the ESP32-C3 + ADS1115 light sensor (serial protocol v1)"
+description = "Rust driver for the ESP32-C3 + ADS1115 light sensor (serial protocol v2)"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

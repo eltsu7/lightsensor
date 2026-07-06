@@ -1,5 +1,5 @@
 //! Contract tests for the light-sensor driver against `SimTransport`
-//! (the firmware emulator implementing protocol v1, docs/reference.md).
+//! (the firmware emulator implementing protocol v2, docs/reference.md).
 //!
 //! `LightSensor::new` takes the transport by value, so to poke the sim
 //! mid-test (light level, gain inspection) the tests wrap it in a shared

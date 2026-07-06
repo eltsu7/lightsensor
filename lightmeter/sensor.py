@@ -73,7 +73,7 @@ def parse_identity(line):
     """Parse an identity line into a DeviceInfo, or None if it doesn't look like one.
 
     Format: '<product> key=value key=value ...' e.g.
-    'lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 ngains=6'
+    'lightsensor proto=2 fw=2.0.0 id=AABBCCDDEEFF sps=860 ngains=6'
     """
     parts = line.split()
     if not parts or "=" in parts[0]:
