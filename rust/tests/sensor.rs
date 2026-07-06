@@ -13,8 +13,8 @@ use std::time::Instant;
 use lightmeter::sim::SimTransport;
 use lightmeter::transport::Result as TResult;
 use lightmeter::{
-    DEFAULT_GAIN, GAIN_VOLTAGES, LightSensor, Reading, SATURATION_VOLTAGE, Transport, best_gain,
-    parse_identity,
+    DEFAULT_GAIN, GAIN_VOLTAGES, LightSensor, PROTO_VERSION, Reading, SATURATION_VOLTAGE,
+    Transport, best_gain, parse_identity,
 };
 
 const HEADROOM: f64 = 0.85;
@@ -480,5 +480,18 @@ fn averaging_reduces_variance() {
     assert!(
         smooth < noisy / 4.0,
         "average=100 variance {smooth} not well below average=1 variance {noisy}"
+    );
+}
+
+/// The crate's semver MAJOR is pinned to the wire protocol version it
+/// speaks: `lightmeter = "2"` is a promise of proto-2 compatibility. A
+/// `PROTO_VERSION` bump without a matching `Cargo.toml` major bump (or vice
+/// versa) breaks that promise silently — catch it here instead.
+#[test]
+fn package_major_version_matches_protocol() {
+    let major: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
+    assert_eq!(
+        major, PROTO_VERSION,
+        "Cargo.toml major version ({major}) must equal PROTO_VERSION ({PROTO_VERSION}) — bump both together"
     );
 }
