@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 # Protocol version this driver speaks. Must match the device's reported `proto`;
 # a mismatch means the command set / response formats may have diverged.
-PROTO_VERSION = 1
+PROTO_VERSION = 2
 
 # Device error codes returned as "err <code>". Keep in sync with firmware ERR_*.
 ERR_MESSAGES = {
@@ -339,12 +339,10 @@ class LightSensor:
         self.baud = baud
         self.ser = None
         self.gain = DEFAULT_GAIN  # locally tracked; updated by set_gain()
-        # Continuous autogain: when True, read() manages gain automatically.
+        # Autogain (autoexposure) is a firmware mode; this mirrors its state.
+        # When True, read() sends `r` and the device steps gain before
+        # replying with the settled gain.
         self.autogain = False
-        self.autogain_interval = 0.25  # seconds between gain evaluations
-        self.autogain_window = 0.5  # seconds of history to consider
-        self._autogain_history: list = []  # (timestamp, voltage_V) pairs
-        self._autogain_last_check = 0.0
         # Dark-offset ("zero"): voltage subtracted from every reading. Stored
         # as volts so it stays correct across gain changes.
         self._zero_offset_v = 0.0
@@ -495,10 +493,10 @@ class LightSensor:
     def _read_raw(self):
         """One locked serial transaction: send 'r<n>' and parse the reply line.
 
-        Returns (raw, sensor_sat, adc_sat) or None on a timeout / malformed line.
-        Raises serial.SerialException / OSError if the link is gone — callers
-        decide whether to reconnect. Logs parse failures so a bad stream isn't
-        silently swallowed.
+        Returns (raw, sensor_sat, adc_sat, gain) or None on a timeout /
+        malformed line. The 4th field (proto 2) is the gain the device used —
+        the settled gain when autogain is on. Raises serial.SerialException /
+        OSError if the link is gone. Logs parse failures.
         """
         n = self.average if self.average and self.average > 1 else 1
         with self._lock:
@@ -510,11 +508,11 @@ class LightSensor:
             log.debug("read timeout (no line)")
             return None
         parts = line.split(",")
-        if len(parts) != 3:
+        if len(parts) != 4:
             log.debug("read parse error: %r", line)
             return None
         try:
-            return int(parts[0]), bool(int(parts[1])), bool(int(parts[2]))
+            return int(parts[0]), bool(int(parts[1])), bool(int(parts[2])), int(parts[3])
         except ValueError:
             log.debug("read parse error: %r", line)
             return None
@@ -526,9 +524,10 @@ class LightSensor:
         sensor_sat -- op-amp output near supply rail (low-gain settings)
         adc_sat    -- ADC raw reading hit 32767 (high-gain settings)
 
-        On a link error: if auto_reconnect is set, transparently reconnects and
-        returns None for this sample; otherwise the exception propagates so a
-        caller managing its own reconnect can handle it.
+        Autoexposure lives in the firmware (see set_autogain); the device
+        reports the gain it used, which we record so reading_voltage converts
+        correctly. On a link error: if auto_reconnect is set, reconnects and
+        returns None; otherwise the exception propagates.
         """
         try:
             raw_parts = self._read_raw()
@@ -540,18 +539,13 @@ class LightSensor:
             return None
         if raw_parts is None:
             return None
-        raw, sensor_sat, adc_sat = raw_parts
-        gain_at_read = self.gain
+        raw, sensor_sat, adc_sat, gain = raw_parts
+        self.gain = gain  # device is the source of truth (autogain may have stepped)
         reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
-        # Autogain and saturation must see the TRUE level, so run autogain on
-        # the un-zeroed reading first.
-        if self.autogain:
-            self._autogain_update(reading)
-        # Subtract the dark offset as the very last step (display only) so it
-        # never affects gain selection or saturation. Use the gain the sample
-        # was actually taken at, in case autogain just changed it.
+        # Subtract the dark offset last (display only) so it never affects
+        # saturation flags. Use the gain the sample was actually taken at.
         if self._zero_offset_v:
-            reading.value -= self._zero_offset_v / GAIN_VOLTAGES[gain_at_read] * 100
+            reading.value -= self._zero_offset_v / GAIN_VOLTAGES[gain] * 100
         return reading
 
     def reading_voltage(self, reading):
@@ -588,7 +582,8 @@ class LightSensor:
         """
         was_autogain = self.autogain
         prev_offset = self._zero_offset_v
-        self.autogain = False
+        if was_autogain:
+            self.set_autogain(False)
         self._zero_offset_v = 0.0
         try:
             voltages = []
@@ -598,7 +593,8 @@ class LightSensor:
                     voltages.append(r.value * GAIN_VOLTAGES[self.gain] / 100)
             self._zero_offset_v = sum(voltages) / len(voltages) if voltages else prev_offset
         finally:
-            self.autogain = was_autogain
+            if was_autogain:
+                self.set_autogain(True)
         return self._zero_offset_v
 
     def clear_zero(self):
@@ -614,42 +610,32 @@ class LightSensor:
         """Current dark offset in volts (0.0 if not zeroed)."""
         return self._zero_offset_v
 
-    def _autogain_update(self, reading):
-        now = time.monotonic()
-        voltage = reading.value * GAIN_VOLTAGES[self.gain] / 100
-        self._autogain_history.append((now, voltage))
-        cutoff = now - self.autogain_window
-        self._autogain_history = [(t, v) for t, v in self._autogain_history if t > cutoff]
-        if now - self._autogain_last_check >= self.autogain_interval:
-            self._autogain_last_check = now
-            if self._autogain_history:
-                new_gain = best_gain(max(v for _, v in self._autogain_history))
-                if new_gain != self.gain:
-                    self._autogain_history.clear()
-                    self.set_gain(new_gain)
+    def set_autogain(self, enabled):
+        """Enable/disable firmware autoexposure (a1/a0). read() then reports
+        the settled gain. Returns True on device ack."""
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"a1" if enabled else b"a0")
+            resp = self.ser.readline().decode(errors="ignore").strip()
+        if resp == "ok":
+            self.autogain = enabled
+            return True
+        log.warning("set_autogain(%s) failed: %s", enabled, _err_text(resp))
+        return False
 
-    def autogain_oneshot(self, n=100):
-        """Collect n samples, find the best gain, apply it, and return the gain index.
-
-        Temporarily disables continuous autogain during the measurement so the
-        gain stays fixed for the full sample set.
-        """
-        was_autogain = self.autogain
-        prev_offset = self._zero_offset_v
-        self.autogain = False
-        self._zero_offset_v = 0.0  # select gain on the true level, not zeroed
-        try:
-            voltages = []
-            for _ in range(n):
-                r = self.read()
-                if r is not None:
-                    voltages.append(r.value * GAIN_VOLTAGES[self.gain] / 100)
-            if voltages:
-                self.set_gain(best_gain(max(voltages)))
-        finally:
-            self.autogain = was_autogain
-            self._zero_offset_v = prev_offset
-        return self.gain
+    def get_autogain(self):
+        """Query device autogain state and current gain (A). Returns
+        (enabled, gain) or None on failure."""
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(b"A")
+            resp = self.ser.readline().decode(errors="ignore").strip()
+        parts = resp.split()
+        if len(parts) == 2 and parts[0] in ("0", "1") and parts[1].isdigit():
+            return parts[0] == "1", int(parts[1])
+        return None
 
     def set_gain(self, gain_index):
         """Set ADC gain. gain_index 0–5 maps to ±6.144V … ±0.256V. Returns True on success."""
@@ -660,6 +646,7 @@ class LightSensor:
             resp = self.ser.readline().decode(errors="ignore").strip()
         if resp == "ok":
             self.gain = gain_index
+            self.autogain = False  # manual gain turns firmware autoexposure off
             return True
         log.warning("set_gain(%s) failed: %s", gain_index, _err_text(resp))
         return False

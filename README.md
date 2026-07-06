@@ -1,7 +1,7 @@
 # lightmeter
 
-Driver and debug GUI for a calibrated light sensor built on an ESP32-C3 SuperMini
-with an OPA323 op-amp and ADS1115 16-bit ADC (I2C).
+Driver, Rust port, and debug GUI for a calibrated light sensor built on an
+ESP32-C3 SuperMini with an OPA323 op-amp and ADS1115 16-bit ADC (I2C).
 
 > Work in progress — the firmware and Python API are still evolving, and the
 > absolute calibration numbers are placeholders pending a reference measurement.
@@ -24,10 +24,13 @@ from lightmeter import LightSensor
 
 with LightSensor() as sensor:        # port auto-detected
     print(sensor.info)               # device identity / firmware
-    sensor.set_gain(2)
+    sensor.set_autogain(True)        # firmware autoexposes each read()
     reading = sensor.read()          # Reading(value, sensor_sat, adc_sat)
-    print(sensor.reading_voltage(reading))
+    print(sensor.gain, sensor.reading_voltage(reading))
 ```
+
+A Rust port (`rust/`, crate `lightmeter`) speaks the same protocol for the
+[pointcamera](https://github.com/eltsu7/pointcamera) turret rig.
 
 See [`docs/reference.md`](docs/reference.md) for the serial protocol, driver API,
 and calibration model.
