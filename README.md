@@ -49,7 +49,7 @@ rust/                                  Rust driver (crate `lightmeter`)
 docs/reference.md                      Serial protocol, driver API, calibration model
 docs/                                  Component datasheets
 tests/                                 Hand-rolled Python test scripts
-CLAUDE.md                              Architecture, invariants, hardware gotchas
+AGENTS.md                              Architecture, invariants, hardware gotchas
 ```
 
 ## Quick start (Python)
@@ -124,7 +124,7 @@ just compile                       # firmware compile only
 ```
 
 `tests/` uses a hand-rolled runner (functions named `test_*`), not pytest.
-See [`CLAUDE.md`](CLAUDE.md) for architecture and the invariants that are easy
+See [`AGENTS.md`](AGENTS.md) for architecture and the invariants that are easy
 to break (voltage as the canonical unit, dark-offset ordering, thread-safety).
 
 ## Roadmap

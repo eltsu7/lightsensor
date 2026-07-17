@@ -1,7 +1,7 @@
 # Reference
 
 Serial protocol, driver API, and calibration model. For the high-level overview,
-architecture, and contributor guidance see [`../CLAUDE.md`](../CLAUDE.md); the
+architecture, and contributor guidance see [`../AGENTS.md`](../AGENTS.md); the
 Python API is also documented in docstrings in `lightmeter/sensor.py`.
 
 ## Serial protocol
@@ -97,7 +97,7 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | `has_calibration()` / `clear_calibration()` | Stored cal size / erase |
 
 Behavioral contracts (thread-safety, reconnect, dark-offset ordering) are in
-CLAUDE.md's invariants. Both dark offsets are stored as volts so they stay
+[`AGENTS.md`](../AGENTS.md). Both dark offsets are stored as volts so they stay
 correct across gain changes. A session zero overrides the persisted device
 offset, and `read()` subtracts the active value last (display only) —
 `sensor_sat` / `adc_sat` still reflect the true raw level. Autoexposure itself

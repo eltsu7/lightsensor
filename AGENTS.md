@@ -24,6 +24,7 @@ BPW34 → OPA323 → ADS1115 → ESP32-C3 firmware → USB-CDC protocol v2
 - USB-CDC uses 115200 baud and a compact single-character protocol; see `docs/reference.md`.
 - Firmware owns the gain table and saturation voltage; hosts mirror them only for conversion and mismatch warnings.
 - Preserve two distinct saturation modes: sensor rail saturation at high full-scale gains versus ADC-count saturation at lower full-scale gains.
+- Firmware-side autogain is authoritative: with autogain enabled, each read settles in the 40–90% full-scale band before averaging; a manual gain command disables it. Hosts record the returned gain and never calculate exposure steps.
 - Store/record **volts**, never gain-relative percent. Apply the active dark correction last for display; it must not affect autogain or saturation decisions. Firmware persists a device baseline (default `0.067144 V` from R1/R3); session `zero()` overrides it and `clear_zero()` restores it.
 - Calibration transfers are CRC32-verified and throttled: Python sends flushed 128-byte chunks with short pauses. Do not replace this with one bulk write.
 - On an interrupted/desynchronized calibration write, remain silent through the device timeout (up to 5 s); a ping resets the firmware payload timeout.
@@ -94,7 +95,9 @@ cd rust && cargo test
 - Use `arduino-cli` through `just` for firmware. Required board core/library setup is documented in `docs/reference.md`; firmware depends on `Adafruit ADS1X15`.
 - Rust is a separate edition-2024 crate under `rust/`; use Cargo from that directory.
 - Do not treat the bundled BPW34 calibration scale as a measured absolute calibration. Preserve provenance (`measured` versus `datasheet-typical`) and spectrum-dependent conversion behavior.
-- Keep the ADS1115 input below 3.6 V. Current wiring and operational constraints belong in `README.md`/firmware; the exploratory LCD pin note is not authoritative for current sensor wiring.
+- Current wiring and operational constraints belong in `README.md`/firmware; the exploratory LCD pin note is not authoritative for current sensor wiring.
+
+- Hardware limits: keep I2C at 100 kHz, never exceed 3.6 V at an ADS1115 input, and expect roughly 330 reads/s in single-shot mode because ALERT/RDY is grounded. Thermal downward drift is observed but not characterized.
 
 ## Testing & QA
 

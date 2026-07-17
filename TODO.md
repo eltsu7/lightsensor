@@ -1,7 +1,7 @@
 # LightSensor — TODO
 
 The v2 hardware migration (ESP32-C3 SuperMini, ADS1115 integrated on the sensor
-PCB, native USB-CDC) is done and shipped — see CLAUDE.md for the current design.
+PCB, native USB-CDC) is done and shipped — see `AGENTS.md` for the current design.
 What's left:
 
 ## Measurement quality
