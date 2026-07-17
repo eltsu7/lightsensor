@@ -20,7 +20,6 @@ from matplotlib.figure import Figure
 from lightmeter.sensor import (
     LightSensor,
     autodetect_port,
-    best_gain,
     daylight_spectrum,
     default_calibration,
     luminous_efficacy,
@@ -243,13 +242,15 @@ class SensorSampler:
                             self._physical_factor = f
                             self._physical_units = cal.scale_units
                     self.status = "connected"
+                    self._zeroed = sensor.is_zeroed
+                    self._zero_offset_v = sensor.zero_offset
 
                 sensor.average = self._average
                 if self._clear_zero_req:
                     self._clear_zero_req = False
                     sensor.clear_zero()
-                    self._zeroed = False
-                    self._zero_offset_v = 0.0
+                    self._zeroed = sensor.is_zeroed
+                    self._zero_offset_v = sensor.zero_offset
                 if self._zero_request > 0:
                     n = self._zero_request
                     self._zero_request = 0
@@ -509,11 +510,11 @@ class SensorApp:
         self._autogain_btn = ttk.Button(gain, text=autogain_label, command=self._toggle_autogain)
         self._autogain_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
-        # Zero (dark-offset) section
-        zero = section("Zero")
-        self._zero_btn = ttk.Button(zero, text="Zero (dark)", command=self._zero)
+        # Temporary background zero; the persisted electrical baseline remains active.
+        zero = section("Dark offset")
+        self._zero_btn = ttk.Button(zero, text="Zero background", command=self._zero)
         self._zero_btn.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(zero, text="Clear zero", command=self._clear_zero).pack(
+        ttk.Button(zero, text="Clear session zero", command=self._clear_zero).pack(
             side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
 
@@ -758,8 +759,9 @@ class SensorApp:
         if self.gain_var.get() != current_label:
             self.gain_var.set(current_label)
 
-        # Show the current dark level on the button (0 when cleared).
-        self._zero_btn.config(text=f"Zero (dark): {self.sampler.zero_offset:.4f} V")
+        # Display the active correction; a session zero overrides the persisted
+        # device baseline and clearing it restores that baseline.
+        self._zero_btn.config(text=f"Zero background: {self.sampler.zero_offset:.4f} V")
 
         # Sample-rate / activity indicator.
         rate = self.sampler.sample_rate

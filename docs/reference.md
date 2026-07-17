@@ -17,7 +17,8 @@ Single-char commands at 115200 baud (`raw` = signed 16-bit 0–32767; flags 0/1)
 | `a0` / `a1` | Disable / enable autogain (autoexposure) | `ok` / `err <code>` |
 | `A` | Query autogain state + current gain | `<0\|1> <gain>` |
 | `p` | Ping (no I2C) | `pong` |
-| `I` | Identity / version handshake | `lightsensor proto=2 fw=… id=<MAC> sps=860 vsat=3.20 gains=6.144,…` |
+| `I` | Identity / version handshake | `lightsensor proto=2 fw=… id=<MAC> sps=860 vsat=3.20 dark=… gains=6.144,…` |
+| `d<volts>\n` / `D` | Persist / query device electrical dark correction (±0.25 V) | `ok` / `err <code>` / volts |
 | `W<n>\n`+bytes | Write calibration blob | `ok <crc32>` / `err <code>` |
 | `C` | Read calibration | `<size> <crc32>\n` + bytes (`0 0` if none) |
 | `H` / `X` | Cal size / erase | size / `ok` / `err <code>` |
@@ -58,6 +59,12 @@ lands in-band (no oscillation).
   pinging, since each byte feeds the pending read and resets its timeout. A `W`
   abort discards only the partial upload; stored calibration is preserved.
 
+- **Electrical dark correction:** firmware persists a per-device offset in
+  LittleFS and reports it as `dark` in `I`. The default is the calculated
+  R1/R3 divider baseline, `3.3 × 270 / (13000 + 270) = 0.067144 V`.
+  `d<volts>\n` updates the value after validating the ±0.25 V range; `D`
+  reads it. This is not an automatic darkness measurement.
+
 ## Driver API (`lightmeter/sensor.py`)
 
 ### Constants
@@ -77,7 +84,9 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | `read()` | Returns `Reading` or `None` |
 | `gain` / `set_gain(i)` / `get_gain()` | Applied gain index (tracked locally, from the device's `r` reply) / set (also disables autogain on the device) / query device |
 | `autogain` / `set_autogain(enabled)` / `get_autogain()` | Local mirror of firmware autoexposure state / enable-disable (`a1`/`a0`) / query device state + gain (`A`) |
-| `zero(n=50)` / `clear_zero()` / `is_zeroed` / `zero_offset` | Dark-offset (volts) measure / clear / state |
+| `device_dark_offset_v` / `set_device_dark_offset(v)` / `reset_device_dark_offset()` | Persisted device electrical correction / update / restore the calculated 0.067144 V divider baseline |
+| `calibrate_device_dark_offset(n=200)` | Measure the covered sensor uncorrected and persist that device value; returns volts or `None` |
+| `zero(n=50)` / `clear_zero()` / `session_zero_offset_v` / `zero_offset` | Temporary background zero / clear it / session value / active correction; clearing restores the device offset |
 | `average` | ADC samples the firmware averages per `read()` (default 1; ~√n noise, ×n time) |
 | `info` / `ping()` / `identify()` / `connected` | Identity from handshake / link check / query / port state |
 | `reconnect(attempts=5, backoff=0.5)` | Re-detect port + reopen + handshake; returns bool, never raises |
@@ -88,21 +97,23 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | `has_calibration()` / `clear_calibration()` | Stored cal size / erase |
 
 Behavioral contracts (thread-safety, reconnect, dark-offset ordering) are in
-CLAUDE.md's invariants; the dark offset is stored as volts so it stays correct
-across gain changes, and `read()` subtracts it last (display only) — `sensor_sat`
-/ `adc_sat` still reflect the true raw level. Autoexposure itself is firmware-side
-(see the protocol table above); the driver only mirrors the resulting gain.
+CLAUDE.md's invariants. Both dark offsets are stored as volts so they stay
+correct across gain changes. A session zero overrides the persisted device
+offset, and `read()` subtracts the active value last (display only) —
+`sensor_sat` / `adc_sat` still reflect the true raw level. Autoexposure itself
+is firmware-side (see the protocol table above); the driver only mirrors the
+resulting gain.
 
 ## Rust driver (`rust/`)
 
 A from-scratch Rust port of this driver (`lightmeter` crate, MIT/Apache-2.0),
 built for the [pointcamera](https://github.com/eltsu7/pointcamera) turret rig.
-Same protocol, same semantics (gain/autogain/zero/reconnect), behind a
-`Transport` trait so a `SimTransport` can emulate the firmware line-by-line for
-hardware-free tests and GUI development. Calibration transfer and the
-spectral/photometric conversion pipeline are intentionally not ported yet —
-raw values and volts are what a consumer needs today; see the crate's own
-rustdoc (`cargo doc --open` in `rust/`) for the full API.
+Same protocol, including persisted device dark correction and temporary
+zeroing, behind a `Transport` trait so a `SimTransport` can emulate the
+firmware line-by-line for hardware-free tests and GUI development. Calibration
+transfer and the spectral/photometric conversion pipeline are intentionally not
+ported yet — raw values and volts are what a consumer needs today; see the
+crate's own rustdoc (`cargo doc --open` in `rust/`) for the full API.
 
 ## Calibration & physical units (`Calibration`)
 

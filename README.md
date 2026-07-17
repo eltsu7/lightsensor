@@ -1,9 +1,9 @@
 # lightmeter
 
 A calibrated light sensor: custom PCB (OPA323 transimpedance amplifier + ADS1115
-16-bit ADC, I2C) read by an ESP32-C3 SuperMini over native USB. Firmware
-autoexposes and streams raw counts; a Python driver + Tkinter GUI and a Rust
-driver both speak the same serial protocol.
+16-bit ADC, I2C) read by an ESP32-C3 SuperMini over native USB. Firmware streams
+raw counts and can autoexpose; a Python driver + Tkinter GUI and a Rust driver
+both speak the same serial protocol.
 
 > **Work in progress.** The absolute calibration numbers are placeholders
 > pending a reference measurement — see [Calibration status](#calibration-status)
@@ -11,15 +11,17 @@ driver both speak the same serial protocol.
 
 ## Features
 
-- **Firmware-side autogain** — the device autoexposes itself (steps gain,
-  re-reads, until in-band) before every averaged read; the host never guesses.
+- **Firmware-side autogain** — when enabled, the device autoexposes itself
+  (steps gain, re-reads, until in-band) before every averaged read; the host never guesses.
 - **Gain-independent data.** Readings convert to volts, not raw counts or
   gain-relative percentages, so a session survives gain changes intact.
-- **Dark-offset zeroing**, saturation flags (op-amp rail vs. ADC overflow —
-  mutually exclusive, both firmware-reported), device-side averaging.
+- **Device dark correction + session zeroing.** Firmware persists a per-device
+  electrical baseline (default: the calculated 67.144 mV R1/R3 divider value);
+  a temporary zero can override it for the current background. Saturation flags
+  (op-amp rail vs. ADC overflow) remain firmware-reported and mutually exclusive.
 - **On-device calibration storage**: a spectral responsivity curve travels
-  with the sensor (LittleFS, CRC32-verified transfer), so any host can read
-  physical units without a separate calibration file.
+  with the sensor (LittleFS, CRC32-verified transfer). The Python driver uses it
+  for physical-unit conversion; the Rust driver currently exposes raw values and volts.
 - **Two drivers, one protocol** — Python (`lightmeter/sensor.py`) and Rust
   (`rust/`, crate `lightmeter`), kept in lock-step by a semver rule (below).
 - **Live Tkinter GUI** — real-time plot with window-average / line-fit
@@ -34,9 +36,9 @@ driver both speak the same serial protocol.
 | OPA323 | Transimpedance amplifier off a BPW34 photodiode |
 
 I2C on GPIO4 (SDA) / GPIO3 (SCL) at 100 kHz (400 kHz was unreliable on this
-wiring). **Never exceed 3.6 V on an ADS1115 input**; the OPA323 output
-saturates around 3.266 V, below the ADC's absolute max. Datasheets for all
-three parts plus the enclosure are under `docs/`.
+wiring). **Never exceed 3.6 V on an ADS1115 input**. The OPA323 output reaches
+about 3.266 V; firmware conservatively reports sensor saturation from 3.20 V.
+Datasheets for all three parts plus the enclosure are under `docs/`.
 
 ## Layout
 
@@ -94,20 +96,22 @@ forgets the matching package bump fails CI instead of shipping silently.
 ## Protocol
 
 Single-char commands at 115200 baud over USB-CDC — read/average (`r`), manual
-or auto gain (`g`/`a`/`A`), identity handshake (`I`), calibration blob
-transfer (`W`/`C`/`H`/`X`). Full command table, response formats, and the
-non-obvious contracts (resync-after-desync, throttled calibration upload,
-firmware-is-source-of-truth) are in [`docs/reference.md`](docs/reference.md).
+or auto gain (`g`/`a`/`A`), identity handshake (`I`), device dark correction
+(`d`/`D`), and calibration blob transfer (`W`/`C`/`H`/`X`). Full command table,
+response formats, and the non-obvious contracts (resync-after-desync, throttled
+calibration upload, firmware-is-source-of-truth) are in
+[`docs/reference.md`](docs/reference.md).
 
 ## Calibration status
 
-The conversion pipeline (spectral responsivity → volts → physical units,
-daylight/lux weighting) is built and unit-tested, but the absolute scale is
-still a datasheet-derived estimate (~±20%), not a measured calibration, and
-the bundled spectral curve is Vishay's typical BPW34 data, not a monochromator
-sweep of this specific sensor. `Calibration.provenance` always tells you which
-you have (`'measured'` vs `'datasheet-typical'`) — see
-[`docs/reference.md`](docs/reference.md).
+The Python conversion pipeline (spectral responsivity → volts → physical units,
+daylight/lux weighting) is built and unit-tested, but the absolute scale is still
+a datasheet-derived estimate (~±20%), not a measured calibration, and the bundled
+spectral curve is Vishay's typical BPW34 data, not a monochromator sweep of this
+specific sensor. `Calibration.provenance` always tells you which you have
+(`'measured'` vs `'datasheet-typical'`) — see
+[`docs/reference.md`](docs/reference.md). The Rust driver intentionally supports
+only raw values and volts today.
 
 ## Development
 

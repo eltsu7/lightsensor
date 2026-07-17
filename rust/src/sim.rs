@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use crate::sensor::{GAIN_VOLTAGES, SATURATION_VOLTAGE};
+use crate::sensor::{DEFAULT_DARK_OFFSET_V, GAIN_VOLTAGES, MAX_DARK_OFFSET_V, SATURATION_VOLTAGE};
 use crate::transport::{Result, Transport};
 
 /// Autoexposure band on % of full scale (matches the firmware).
@@ -24,6 +24,7 @@ pub struct SimTransport {
     gain: usize,
     autogain: bool,
     replies: VecDeque<String>,
+    dark_offset_v: f64,
     rng: u64,
     /// When set, the device plays dead (tests the resync path).
     pub mute: bool,
@@ -38,6 +39,7 @@ impl Default for SimTransport {
             autogain: false,
             replies: VecDeque::new(),
             rng: 0x1234_5678_9ABC_DEF0,
+            dark_offset_v: DEFAULT_DARK_OFFSET_V,
             mute: false,
         }
     }
@@ -105,17 +107,25 @@ impl SimTransport {
         let sensor_sat = full_scale > SATURATION_VOLTAGE && volts >= SATURATION_VOLTAGE;
         let raw = ((volts / full_scale) * 32767.0).round().min(32767.0) as i32;
         let adc_sat = full_scale < SATURATION_VOLTAGE && raw >= 32767;
-        format!("{},{},{},{}", raw.min(32767), sensor_sat as u8, adc_sat as u8, self.gain)
+        format!(
+            "{},{},{},{}",
+            raw.min(32767),
+            sensor_sat as u8,
+            adc_sat as u8,
+            self.gain
+        )
     }
 
     fn handle(&mut self, cmd: &str) {
         let reply = match cmd {
             "p" => "pong".to_string(),
             "I" => format!(
-                "lightsensor proto=2 fw=sim-2.0 id=00:11:22:33:44:55 sps=860 vsat=3.20 gains={}",
+                "lightsensor proto=2 fw=sim-2.1.0 id=00:11:22:33:44:55 sps=860 vsat=3.20 dark={:.6} gains={}",
+                self.dark_offset_v,
                 GAIN_VOLTAGES.map(|v| v.to_string()).join(",")
             ),
             "G" => self.gain.to_string(),
+            "D" => format!("{:.9}", self.dark_offset_v),
             "A" => format!("{} {}", self.autogain as u8, self.gain),
             "a1" => {
                 self.autogain = true;
@@ -133,6 +143,13 @@ impl SimTransport {
                 Ok(i) if i < GAIN_VOLTAGES.len() => {
                     self.gain = i;
                     self.autogain = false; // manual gain turns autoexposure off
+                    "ok".to_string()
+                }
+                _ => "err 1".to_string(),
+            },
+            _ if cmd.starts_with('d') => match cmd[1..].trim().parse::<f64>() {
+                Ok(offset) if offset.is_finite() && offset.abs() <= MAX_DARK_OFFSET_V => {
+                    self.dark_offset_v = offset;
                     "ok".to_string()
                 }
                 _ => "err 1".to_string(),

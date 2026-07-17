@@ -32,7 +32,7 @@ pub mod sim;
 pub mod transport;
 
 pub use sensor::{
-    DEFAULT_GAIN, DeviceInfo, GAIN_LABELS, GAIN_VOLTAGES, LightSensor, PROTO_VERSION, Reading,
-    SATURATION_VOLTAGE, best_gain, parse_identity,
+    DEFAULT_DARK_OFFSET_V, DEFAULT_GAIN, DeviceInfo, GAIN_LABELS, GAIN_VOLTAGES, LightSensor,
+    MAX_DARK_OFFSET_V, PROTO_VERSION, Reading, SATURATION_VOLTAGE, best_gain, parse_identity,
 };
 pub use transport::{SerialTransport, Transport, autodetect_port};

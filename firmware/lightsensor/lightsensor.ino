@@ -8,7 +8,7 @@
 // Protocol/firmware identity. Bump PROTO_VERSION on any breaking change to the
 // serial command set or response formats; bump FW_VERSION for any release.
 #define PROTO_VERSION 2
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 
 // Error codes returned as "err <code>" by command-style responses. 0 is never
 // emitted (success uses "ok"). Keep in sync with lightsensor.py ERR_*.
@@ -34,6 +34,12 @@ void sendErr(int code) {
 // CRC32 (standard reflected poly, matches Python's binascii.crc32).
 const char* CAL_PATH = "/cal.csv";
 
+// Per-device electrical dark baseline. The nominal value is the R1/R3 divider:
+// 3.3 V × 270 Ω / (13 kΩ + 270 Ω). A calibrated value overrides it in LittleFS.
+const char* DARK_OFFSET_PATH = "/dark_offset_v";
+const float DEFAULT_DARK_OFFSET_V = 3.3f * 270.0f / (13000.0f + 270.0f);
+const float DARK_OFFSET_LIMIT_V = 0.25f;
+
 // Running CRC32 (no final XOR until done). Feed bytes incrementally.
 uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) {
@@ -42,6 +48,53 @@ uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
       crc = (crc >> 1) ^ (0xEDB88320UL & (-(int32_t)(crc & 1)));
   }
   return crc;
+}
+
+bool isValidDarkOffset(float offset) {
+  return isfinite(offset) && offset >= -DARK_OFFSET_LIMIT_V && offset <= DARK_OFFSET_LIMIT_V;
+}
+
+float readDarkOffset() {
+  File f = LittleFS.open(DARK_OFFSET_PATH, "r");
+  if (!f) return DEFAULT_DARK_OFFSET_V;
+  char text[32];
+  size_t n = f.readBytesUntil('\n', text, sizeof(text) - 1);
+  f.close();
+  text[n] = '\0';
+  char* end;
+  float offset = strtof(text, &end);
+  return end != text && *end == '\0' && isValidDarkOffset(offset)
+    ? offset
+    : DEFAULT_DARK_OFFSET_V;
+}
+
+bool writeDarkOffset(float offset) {
+  File f = LittleFS.open(DARK_OFFSET_PATH, "w");
+  if (!f) return false;
+  size_t written = f.print(offset, 9);
+  written += f.print('\n');
+  f.close();
+  return written > 1;
+}
+
+bool readDarkOffsetArgument(float* offset) {
+  char text[32];
+  size_t n = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 1000) {
+    if (Serial.available() <= 0) continue;
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') break;
+    if (n >= sizeof(text) - 1) return false;
+    text[n++] = c;
+    t0 = millis();
+  }
+  text[n] = '\0';
+  char* end;
+  float value = strtof(text, &end);
+  if (end == text || *end != '\0' || !isValidDarkOffset(value)) return false;
+  *offset = value;
+  return true;
 }
 
 // ESP32-C3 SuperMini I2C pins (v3 wiring: SDA/SCL next to 3V3/GND).
@@ -258,6 +311,8 @@ void sendIdentity() {
   Serial.print(id);
   Serial.print(" sps=860 vsat=");
   Serial.print(SENSOR_SAT_V);
+  Serial.print(" dark=");
+  Serial.print(readDarkOffset(), 6);
   Serial.print(" gains=");
   for (int i = 0; i < ngains; i++) {
     if (i) Serial.print(",");
@@ -278,6 +333,19 @@ void loop() {
 
     } else if (cmd == 'I') {
       sendIdentity();  // product/proto/fw/id line for host handshake
+
+    } else if (cmd == 'D') {
+      Serial.println(readDarkOffset(), 9);
+
+    } else if (cmd == 'd') {
+      float offset;
+      if (!readDarkOffsetArgument(&offset)) {
+        sendErr(ERR_BAD_ARG);
+      } else if (writeDarkOffset(offset)) {
+        Serial.println("ok");
+      } else {
+        sendErr(ERR_WRITE);
+      }
 
     } else if (cmd == 'g') {
       while (!Serial.available());

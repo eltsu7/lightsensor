@@ -28,8 +28,8 @@ uv build                          # build the wheel
 
 Three layers over one USB-CDC serial link at 115200 baud:
 
-1. **Firmware** (`firmware/lightsensor/lightsensor.ino`, Arduino/ESP32-C3) — owns the ADS1115 over I2C and a LittleFS partition. A flat single-char command loop. Returns raw ADC counts and (proto 2+) the settled gain; autogain (autoexposure) is implemented here — `r` steps gain on over/under-exposure before averaging, `a0`/`a1`/`A` toggle and query the mode. No unit conversion. (The `.ino` must live in a directory of the same name — Arduino constraint.)
-2. **Drivers** — `lightmeter/sensor.py` (`LightSensor`) and `rust/` (`lightmeter` crate) each wrap the serial protocol identically: counts→voltage, gain bookkeeping (mirroring the device-reported gain), dark-offset (`zero`), calibration parse/conversion (Python only, for now). Both drivers are thin: autogain is a device mode they toggle, not something they compute. `lightmeter/port_detect.py` does cross-platform port autodetection (also used by the justfile); the Rust driver has its own equivalent.
+1. **Firmware** (`firmware/lightsensor/lightsensor.ino`, Arduino/ESP32-C3) — owns the ADS1115 over I2C and a LittleFS partition. A flat single-char command loop. Returns raw ADC counts and (proto 2+) the settled gain; autogain (autoexposure) is implemented here — `r` steps gain on over/under-exposure before averaging, `a0`/`a1`/`A` toggle and query the mode. It persists per-device electrical dark correction (`d`/`D`), defaulting to the calculated 67.144 mV R1/R3 divider baseline. No unit conversion. (The `.ino` must live in a directory of the same name — Arduino constraint.)
+2. **Drivers** — `lightmeter/sensor.py` (`LightSensor`) and `rust/` (`lightmeter` crate) each wrap the serial protocol identically: counts→voltage, gain bookkeeping (mirroring the device-reported gain), persisted dark correction plus session `zero`, calibration parse/conversion (Python only, for now). Both drivers are thin: autogain is a device mode they toggle, not something they compute. `lightmeter/port_detect.py` does cross-platform port autodetection (also used by the justfile); the Rust driver has its own equivalent.
 3. **GUI** (`lightmeter/gui.py`) — Tkinter app, background sampler thread decoupled from the ~33 fps plot. Records to `recordings/rec_*.csv` (git-ignored); `save_recording` / `open_recording_plot` are reusable for a future "previous measurements" picker.
 
 ## Key invariants (easy to break)
@@ -39,6 +39,7 @@ Three layers over one USB-CDC serial link at 115200 baud:
 - **Two mutually-exclusive saturation modes**, set by gain: `sensor_sat` (op-amp at rail, gains 0–1, full-scale > 3.266 V) vs `adc_sat` (counts hit 32767, gains 2–5). Both come from the firmware per reading.
 - **Thread-safe / reconnect:** every serial transaction is guarded by a re-entrant lock. A cleanly-closed port is transparently reopened. On a real link error, `auto_reconnect` off (default) re-raises so a caller with its own loop (the GUI sampler) handles it; on, `read()` calls `reconnect()` and returns `None`.
 - **Calibration transfer must be throttled and is CRC-verified.** Don't "optimize" `write_calibration` into one big burst — it overruns the device RX buffer. See `docs/reference.md` for why, plus the resync and firmware-is-source-of-truth contracts.
+- **Dark correction has two scopes:** the device baseline is persisted in volts and applied by default; `zero()` measures an uncorrected scene/background level and temporarily overrides it. `clear_zero()` restores the device baseline. Neither offset feeds autogain or saturation logic.
 
 ## Hardware gotchas
 

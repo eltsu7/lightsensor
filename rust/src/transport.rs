@@ -41,7 +41,9 @@ pub fn autodetect_port() -> Result<String> {
     let ports = serialport::available_ports()
         .map_err(|e| std::io::Error::other(format!("port enumeration failed: {e}")))?;
     if ports.is_empty() {
-        return Err(std::io::Error::other("no serial ports found — is the device plugged in?"));
+        return Err(std::io::Error::other(
+            "no serial ports found — is the device plugged in?",
+        ));
     }
 
     let usb_info = |p: &serialport::SerialPortInfo| match &p.port_type {
@@ -103,7 +105,11 @@ impl SerialTransport {
             .timeout(Self::DEFAULT_TIMEOUT)
             .open()
             .map_err(|e| std::io::Error::other(format!("open {path} failed: {e}")))?;
-        Ok(Self { port, pending: Vec::new(), timeout: Self::DEFAULT_TIMEOUT })
+        Ok(Self {
+            port,
+            pending: Vec::new(),
+            timeout: Self::DEFAULT_TIMEOUT,
+        })
     }
 
     pub fn path(&self) -> Option<String> {

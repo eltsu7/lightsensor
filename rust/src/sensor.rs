@@ -19,12 +19,17 @@ pub const PROTO_VERSION: u32 = 2;
 
 /// Gain index → ADC full-scale voltage. Index 1 (±4.096 V) is the default.
 pub const GAIN_VOLTAGES: [f64; 6] = [6.144, 4.096, 2.048, 1.024, 0.512, 0.256];
-pub const GAIN_LABELS: [&str; 6] =
-    ["±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V"];
+pub const GAIN_LABELS: [&str; 6] = [
+    "±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V",
+];
 pub const DEFAULT_GAIN: usize = 1;
 
 /// OPA323 output saturates ~34 mV below the 3.3 V rail (measured).
 pub const SATURATION_VOLTAGE: f64 = 3.2;
+
+/// Nominal R1/R3 electrical dark baseline: 3.3 V × 270 Ω / (13 kΩ + 270 Ω).
+pub const DEFAULT_DARK_OFFSET_V: f64 = 3.3 * 270.0 / (13_000.0 + 270.0);
+pub const MAX_DARK_OFFSET_V: f64 = 0.25;
 
 /// Highest gain index that keeps `max_voltage` below saturation with the
 /// given headroom (default 0.85). Falls back to 0 (widest range).
@@ -93,14 +98,19 @@ pub fn err_text(resp: &str) -> String {
         (6, "write size mismatch"),
         (7, "erase failed"),
     ];
-    if let Some(code) = resp.strip_prefix("err ").and_then(|c| c.trim().parse::<u32>().ok())
+    if let Some(code) = resp
+        .strip_prefix("err ")
+        .and_then(|c| c.trim().parse::<u32>().ok())
         && let Some((_, text)) = MESSAGES.iter().find(|(c, _)| *c == code)
     {
         return format!("err {code} ({text})");
     }
-    if resp.is_empty() { "no response".into() } else { resp.into() }
+    if resp.is_empty() {
+        "no response".into()
+    } else {
+        resp.into()
+    }
 }
-
 
 pub struct LightSensor<T: Transport> {
     transport: T,
@@ -113,8 +123,10 @@ pub struct LightSensor<T: Transport> {
     /// When set, `read` autoexposes: re-reads, stepping gain, until the
     /// sample lands in the band or a gain rail is hit.
     autogain: bool,
-    /// Dark offset in volts — kept in volts so it survives gain changes.
-    zero_offset_v: f64,
+    /// Persisted per-device electrical dark correction in volts.
+    device_dark_offset_v: f64,
+    /// Temporary session dark/background correction; overrides the device value.
+    session_zero_offset_v: Option<f64>,
 }
 
 /// Longest the device can block waiting for a command payload (the `W`
@@ -130,7 +142,8 @@ impl<T: Transport> LightSensor<T> {
             average: 1,
             info: None,
             autogain: false,
-            zero_offset_v: 0.0,
+            device_dark_offset_v: DEFAULT_DARK_OFFSET_V,
+            session_zero_offset_v: None,
         };
         sensor.handshake()?;
         Ok(sensor)
@@ -158,6 +171,7 @@ impl<T: Transport> LightSensor<T> {
             }
         }
         self.info = self.identify()?;
+        self.load_device_dark_offset();
         let Some(info) = &self.info else {
             log::warn!("device did not report identity (old firmware?)");
             return Ok(());
@@ -181,7 +195,23 @@ impl<T: Transport> LightSensor<T> {
     /// Query device identity (`I`).
     pub fn identify(&mut self) -> Result<Option<DeviceInfo>> {
         self.transport.send(b"I")?;
-        Ok(self.transport.read_line()?.as_deref().and_then(parse_identity))
+        Ok(self
+            .transport
+            .read_line()?
+            .as_deref()
+            .and_then(parse_identity))
+    }
+
+    fn load_device_dark_offset(&mut self) {
+        let Some(value) = self.info.as_ref().and_then(|info| info.fields.get("dark")) else {
+            return;
+        };
+        match value.parse::<f64>() {
+            Ok(offset) if offset.is_finite() && offset.abs() <= MAX_DARK_OFFSET_V => {
+                self.device_dark_offset_v = offset;
+            }
+            _ => log::warn!("invalid device dark offset: {value:?}"),
+        }
     }
 
     /// One `r<n>` transaction → `(raw, sensor_sat, adc_sat, gain)`. The gain
@@ -224,11 +254,16 @@ impl<T: Transport> LightSensor<T> {
             return Ok(None);
         };
         self.gain = gain.min(GAIN_VOLTAGES.len() - 1);
-        let mut reading = Reading { value: raw as f64 / 32767.0 * 100.0, sensor_sat, adc_sat };
+        let mut reading = Reading {
+            value: raw as f64 / 32767.0 * 100.0,
+            sensor_sat,
+            adc_sat,
+        };
         // Dark offset subtracted last (display only); saturation flags keep
         // reflecting the TRUE level.
-        if self.zero_offset_v != 0.0 {
-            reading.value -= self.zero_offset_v / GAIN_VOLTAGES[self.gain] * 100.0;
+        let offset = self.effective_dark_offset();
+        if offset != 0.0 {
+            reading.value -= offset / GAIN_VOLTAGES[self.gain] * 100.0;
         }
         Ok(Some(reading))
     }
@@ -255,40 +290,111 @@ impl<T: Transport> LightSensor<T> {
     /// Query the device's current gain index.
     pub fn get_gain(&mut self) -> Result<Option<usize>> {
         self.transport.send(b"G")?;
-        Ok(self.transport.read_line()?.and_then(|l| l.trim().parse().ok()))
+        Ok(self
+            .transport
+            .read_line()?
+            .and_then(|l| l.trim().parse().ok()))
     }
 
-    /// Measure the dark level over `n` samples and subtract it from all
-    /// future reads. Returns the offset in volts. Autogain and any existing
-    /// offset are suspended so the true level is captured.
-    pub fn zero(&mut self, n: usize) -> Result<f64> {
+    /// Persisted per-device electrical dark correction in volts.
+    pub fn device_dark_offset(&self) -> f64 {
+        self.device_dark_offset_v
+    }
+
+    /// Temporary session dark/background correction, if active.
+    pub fn session_zero_offset(&self) -> Option<f64> {
+        self.session_zero_offset_v
+    }
+
+    /// Active correction: session zero overrides the persisted device baseline.
+    pub fn effective_dark_offset(&self) -> f64 {
+        self.session_zero_offset_v
+            .unwrap_or(self.device_dark_offset_v)
+    }
+
+    /// Persist a per-device electrical dark correction in volts.
+    ///
+    /// Returns `Ok(true)` only after firmware acknowledges the flash write.
+    pub fn set_device_dark_offset(&mut self, offset: f64) -> Result<bool> {
+        if !offset.is_finite() || offset.abs() > MAX_DARK_OFFSET_V {
+            return Ok(false);
+        }
+        self.transport.send(format!("d{offset:.9}\n").as_bytes())?;
+        let response = self.transport.read_line()?.unwrap_or_default();
+        if response != "ok" {
+            log::warn!(
+                "set_device_dark_offset({offset}) failed: {}",
+                err_text(&response)
+            );
+            return Ok(false);
+        }
+        self.device_dark_offset_v = offset;
+        if let Some(info) = &mut self.info {
+            info.fields.insert("dark".into(), format!("{offset:.9}"));
+        }
+        Ok(true)
+    }
+
+    /// Restore the calculated R1/R3 divider baseline on the device.
+    pub fn reset_device_dark_offset(&mut self) -> Result<bool> {
+        self.set_device_dark_offset(DEFAULT_DARK_OFFSET_V)
+    }
+
+    /// Measure covered-sensor dark voltage and persist it on the device.
+    ///
+    /// Autogain and session zeroing are suspended while sampling the true
+    /// electrical level. Returns `Ok(None)` if no valid samples arrive or the
+    /// device rejects the flash write.
+    pub fn calibrate_device_dark_offset(&mut self, n: usize) -> Result<Option<f64>> {
         let was_autogain = self.autogain;
-        let prev_offset = self.zero_offset_v;
+        let previous_session = self.session_zero_offset_v;
         if was_autogain {
             self.set_autogain(false)?;
         }
-        self.zero_offset_v = 0.0;
-
-        let result = self.mean_voltage(n);
-
+        self.session_zero_offset_v = None;
+        let measured = self.mean_uncorrected_voltage(n);
+        self.session_zero_offset_v = previous_session;
         if was_autogain {
             self.set_autogain(true)?;
         }
-        self.zero_offset_v = result?.unwrap_or(prev_offset);
-        Ok(self.zero_offset_v)
+        let Some(offset) = measured? else {
+            return Ok(None);
+        };
+        Ok(self.set_device_dark_offset(offset)?.then_some(offset))
     }
 
+    /// Temporarily zero the current dark/background level over `n` samples.
+    ///
+    /// A session zero overrides, but never overwrites, the persisted device
+    /// dark correction. Returns the active offset in volts.
+    pub fn zero(&mut self, n: usize) -> Result<f64> {
+        let was_autogain = self.autogain;
+        let previous_session = self.session_zero_offset_v;
+        if was_autogain {
+            self.set_autogain(false)?;
+        }
+        self.session_zero_offset_v = None;
+        let measured = self.mean_uncorrected_voltage(n);
+        self.session_zero_offset_v = previous_session;
+        if was_autogain {
+            self.set_autogain(true)?;
+        }
+        self.session_zero_offset_v = measured?.or(previous_session);
+        Ok(self.effective_dark_offset())
+    }
+
+    /// Clear the session zero and resume the persisted device correction.
     pub fn clear_zero(&mut self) {
-        self.zero_offset_v = 0.0;
+        self.session_zero_offset_v = None;
     }
 
     pub fn is_zeroed(&self) -> bool {
-        self.zero_offset_v != 0.0
+        self.effective_dark_offset() != 0.0
     }
 
-    /// Current dark offset in volts (0.0 if not zeroed).
+    /// Current effective dark correction in volts.
     pub fn zero_offset(&self) -> f64 {
-        self.zero_offset_v
+        self.effective_dark_offset()
     }
 
     /// Enable/disable firmware autoexposure (`a1`/`a0`). `read` then reports
@@ -300,14 +406,19 @@ impl<T: Transport> LightSensor<T> {
             self.autogain = enabled;
             Ok(())
         } else {
-            Err(std::io::Error::other(format!("set_autogain failed: {}", err_text(&resp))))
+            Err(std::io::Error::other(format!(
+                "set_autogain failed: {}",
+                err_text(&resp)
+            )))
         }
     }
 
     /// Query the device's autogain state and current gain (`A`).
     pub fn get_autogain(&mut self) -> Result<Option<(bool, usize)>> {
         self.transport.send(b"A")?;
-        let Some(line) = self.transport.read_line()? else { return Ok(None) };
+        let Some(line) = self.transport.read_line()? else {
+            return Ok(None);
+        };
         let mut it = line.split_whitespace();
         let auto = it.next().and_then(|s| s.parse::<u8>().ok());
         let gain = it.next().and_then(|s| s.parse::<usize>().ok());
@@ -325,15 +436,19 @@ impl<T: Transport> LightSensor<T> {
     // helpers
     //
 
-    fn sample_voltage(&mut self) -> Result<Option<f64>> {
-        Ok(self.read()?.map(|r| r.value * GAIN_VOLTAGES[self.gain] / 100.0))
+    fn sample_uncorrected_voltage(&mut self) -> Result<Option<f64>> {
+        let Some((raw, _, _, gain)) = self.read_raw()? else {
+            return Ok(None);
+        };
+        self.gain = gain.min(GAIN_VOLTAGES.len() - 1);
+        Ok(Some(raw as f64 / 32767.0 * GAIN_VOLTAGES[self.gain]))
     }
 
-    fn mean_voltage(&mut self, n: usize) -> Result<Option<f64>> {
-        let mut voltages = Vec::with_capacity(n);
-        for _ in 0..n {
-            if let Some(v) = self.sample_voltage()? {
-                voltages.push(v);
+    fn mean_uncorrected_voltage(&mut self, n: usize) -> Result<Option<f64>> {
+        let mut voltages = Vec::with_capacity(n.max(1));
+        for _ in 0..n.max(1) {
+            if let Some(voltage) = self.sample_uncorrected_voltage()? {
+                voltages.push(voltage);
             }
         }
         Ok((!voltages.is_empty()).then(|| voltages.iter().sum::<f64>() / voltages.len() as f64))

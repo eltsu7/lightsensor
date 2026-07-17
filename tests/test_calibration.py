@@ -7,6 +7,10 @@ import os
 import tomllib
 
 from lightmeter.sensor import (
+    DEFAULT_DARK_OFFSET_V,
+    DEFAULT_GAIN,
+    GAIN_VOLTAGES,
+    LightSensor,
     PROTO_VERSION,
     daylight_spectrum,
     default_calibration,
@@ -178,6 +182,53 @@ def test_lux_factor_from_default():
     # Low-light 2 MΩ front end: full-scale (~3.27 V) is a modest indoor level.
     assert 20 < lux * 3.266 < 400
 
+
+
+def bare_sensor(device_offset=DEFAULT_DARK_OFFSET_V):
+    """Construct only the state used by dark-offset unit tests; no serial port."""
+    sensor = LightSensor.__new__(LightSensor)
+    sensor._device_dark_offset_v = device_offset
+    sensor._session_zero_offset_v = None
+    sensor.autogain = False
+    sensor.auto_reconnect = False
+    sensor.gain = DEFAULT_GAIN
+    return sensor
+
+
+def test_default_dark_offset_matches_schematic_divider():
+    assert approx(DEFAULT_DARK_OFFSET_V, 3.3 * 270 / (13_000 + 270))
+
+
+def test_session_zero_overrides_and_clears_to_device_offset():
+    sensor = bare_sensor(0.067)
+    sensor._measure_uncorrected_offset = lambda n: 0.100
+    assert approx(sensor.zero(5), 0.100)
+    assert approx(sensor.session_zero_offset_v, 0.100)
+    sensor.clear_zero()
+    assert sensor.session_zero_offset_v is None
+    assert approx(sensor.zero_offset, 0.067)
+
+
+def test_dark_offset_is_applied_last_without_changing_saturation_flags():
+    sensor = bare_sensor(0.067)
+    raw = 10_000
+    sensor._read_raw = lambda: (raw, True, False, DEFAULT_GAIN)
+    reading = sensor.read()
+    expected = raw / 32767 * 100 - 0.067 / GAIN_VOLTAGES[DEFAULT_GAIN] * 100
+    assert approx(reading.value, expected)
+    assert reading.sensor_sat is True
+    assert reading.adc_sat is False
+
+
+def test_device_dark_calibration_uses_uncorrected_measurement():
+    sensor = bare_sensor(0.067)
+    sensor._session_zero_offset_v = 0.100
+    sensor._measure_uncorrected_offset = lambda n: 0.080
+    saved = []
+    sensor.set_device_dark_offset = lambda offset: saved.append(offset) or True
+    assert approx(sensor.calibrate_device_dark_offset(200), 0.080)
+    assert saved == [0.080]
+    assert approx(sensor.session_zero_offset_v, 0.100)
 
 def test_package_major_matches_protocol():
     """The package's semver MAJOR is pinned to the wire protocol version it

@@ -43,6 +43,11 @@ DEFAULT_GAIN = 1  # ±4.096V
 # In absolute scale (value * gain_voltage) this equals ~326.6.
 SATURATION_VOLTAGE = 3.2  # V
 
+# Electrical dark baseline from the schematic's R1/R3 divider:
+# 3.3 V × 270 Ω / (13 kΩ + 270 Ω). Firmware persists a per-device override.
+DEFAULT_DARK_OFFSET_V = 3.3 * 270 / (13_000 + 270)
+MAX_DARK_OFFSET_V = 0.25
+
 
 def best_gain(max_voltage, headroom=0.85):
     """Return the highest gain index that won't saturate for the given peak voltage.
@@ -343,9 +348,10 @@ class LightSensor:
         # When True, read() sends `r` and the device steps gain before
         # replying with the settled gain.
         self.autogain = False
-        # Dark-offset ("zero"): voltage subtracted from every reading. Stored
-        # as volts so it stays correct across gain changes.
-        self._zero_offset_v = 0.0
+        # Device dark offset is persisted by firmware; a session zero may
+        # temporarily override it. Both are volts, so gain changes are safe.
+        self._device_dark_offset_v = DEFAULT_DARK_OFFSET_V
+        self._session_zero_offset_v = None
         # Firmware-side averaging: each read() averages this many ADC samples
         # on the device and returns one Reading.
         self.average = 1
@@ -464,6 +470,25 @@ class LightSensor:
                 self.port, self.info.proto, PROTO_VERSION,
             )
         self._verify_constants()
+        self._load_device_dark_offset()
+
+    def _load_device_dark_offset(self):
+        """Adopt the firmware-reported dark offset when it is valid.
+
+        Older firmware omits the optional identity field; retain the calculated
+        schematic default in that case.
+        """
+        value = self.info.fields.get("dark")
+        if value is None:
+            return
+        try:
+            offset = float(value)
+        except ValueError:
+            offset = None
+        if offset is None or not math.isfinite(offset) or abs(offset) > MAX_DARK_OFFSET_V:
+            log.warning("invalid device dark offset: %r", value)
+            return
+        self._device_dark_offset_v = offset
 
     def _verify_constants(self):
         """Warn if the driver's mirrored constants drift from the device's.
@@ -542,10 +567,11 @@ class LightSensor:
         raw, sensor_sat, adc_sat, gain = raw_parts
         self.gain = gain  # device is the source of truth (autogain may have stepped)
         reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
-        # Subtract the dark offset last (display only) so it never affects
-        # saturation flags. Use the gain the sample was actually taken at.
-        if self._zero_offset_v:
-            reading.value -= self._zero_offset_v / GAIN_VOLTAGES[gain] * 100
+        # Subtract the effective dark offset last (display only) so it never
+        # affects saturation flags. Use the gain the sample was actually taken at.
+        offset = self.effective_dark_offset_v
+        if offset:
+            reading.value -= offset / GAIN_VOLTAGES[gain] * 100
         return reading
 
     def reading_voltage(self, reading):
@@ -573,42 +599,117 @@ class LightSensor:
             return None
         return self.calibration.voltage_to_value(self.reading_voltage(reading), source)
 
-    def zero(self, n=50):
-        """Measure the dark/background level over n samples and subtract it from
-        all future reads. Returns the measured offset in volts.
+    def _measure_uncorrected_offset(self, n):
+        """Average n uncorrected samples in volts, or return None on failure."""
+        voltages = []
+        for _ in range(max(1, int(n))):
+            raw_parts = self._read_raw()
+            if raw_parts is None:
+                continue
+            raw, _, _, gain = raw_parts
+            self.gain = gain
+            voltages.append(raw / 32767 * GAIN_VOLTAGES[gain])
+        return sum(voltages) / len(voltages) if voltages else None
 
-        Continuous autogain and any existing offset are suspended during the
-        measurement so the true level is captured at the current gain.
+    @property
+    def device_dark_offset_v(self):
+        """Persisted per-device electrical dark correction in volts."""
+        return self._device_dark_offset_v
+
+    @property
+    def session_zero_offset_v(self):
+        """Temporary session dark/background correction, or None if inactive."""
+        return self._session_zero_offset_v
+
+    @property
+    def effective_dark_offset_v(self):
+        """Active correction in volts: session zero overrides device calibration."""
+        return (
+            self._session_zero_offset_v
+            if self._session_zero_offset_v is not None
+            else self._device_dark_offset_v
+        )
+
+    def set_device_dark_offset(self, offset_v):
+        """Persist a per-device electrical dark correction in volts.
+
+        Valid offsets are finite values within ±0.25 V. Returns True only after
+        firmware acknowledges the flash write.
+        """
+        try:
+            offset = float(offset_v)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(offset) or abs(offset) > MAX_DARK_OFFSET_V:
+            return False
+        with self._lock:
+            if not self.connected:
+                self.open()
+            self.ser.write(f"d{offset:.9g}\n".encode())
+            resp = self.ser.readline().decode(errors="ignore").strip()
+        if resp != "ok":
+            log.warning("set_device_dark_offset(%s) failed: %s", offset, _err_text(resp))
+            return False
+        self._device_dark_offset_v = offset
+        if self.info is not None:
+            self.info.fields["dark"] = f"{offset:.9g}"
+        return True
+
+    def reset_device_dark_offset(self):
+        """Restore the calculated R1/R3 divider baseline on the device."""
+        return self.set_device_dark_offset(DEFAULT_DARK_OFFSET_V)
+
+    def calibrate_device_dark_offset(self, n=200):
+        """Measure covered-sensor dark voltage and persist it on the device.
+
+        Autogain and session zeroing are suspended while sampling the true
+        electrical level. Returns the persisted volts, or None on failure.
         """
         was_autogain = self.autogain
-        prev_offset = self._zero_offset_v
+        previous_session = self._session_zero_offset_v
         if was_autogain:
             self.set_autogain(False)
-        self._zero_offset_v = 0.0
         try:
-            voltages = []
-            for _ in range(n):
-                r = self.read()
-                if r is not None:
-                    voltages.append(r.value * GAIN_VOLTAGES[self.gain] / 100)
-            self._zero_offset_v = sum(voltages) / len(voltages) if voltages else prev_offset
+            self._session_zero_offset_v = None
+            offset = self._measure_uncorrected_offset(n)
+        finally:
+            self._session_zero_offset_v = previous_session
+            if was_autogain:
+                self.set_autogain(True)
+        return offset if offset is not None and self.set_device_dark_offset(offset) else None
+
+    def zero(self, n=50):
+        """Temporarily zero the current dark/background level over n samples.
+
+        A session zero overrides, but never overwrites, the persisted device
+        dark correction. Returns the effective offset in volts.
+        """
+        was_autogain = self.autogain
+        previous_session = self._session_zero_offset_v
+        if was_autogain:
+            self.set_autogain(False)
+        try:
+            self._session_zero_offset_v = None
+            offset = self._measure_uncorrected_offset(n)
+            self._session_zero_offset_v = offset if offset is not None else previous_session
         finally:
             if was_autogain:
                 self.set_autogain(True)
-        return self._zero_offset_v
+        return self.effective_dark_offset_v
 
     def clear_zero(self):
-        """Remove the dark offset so reads return the raw level again."""
-        self._zero_offset_v = 0.0
+        """Clear the session zero and resume the persisted device correction."""
+        self._session_zero_offset_v = None
 
     @property
     def is_zeroed(self):
-        return self._zero_offset_v != 0.0
+        """True when either a session or persisted dark correction is active."""
+        return self.effective_dark_offset_v != 0.0
 
     @property
     def zero_offset(self):
-        """Current dark offset in volts (0.0 if not zeroed)."""
-        return self._zero_offset_v
+        """Current effective dark correction in volts."""
+        return self.effective_dark_offset_v
 
     def set_autogain(self, enabled):
         """Enable/disable firmware autoexposure (a1/a0). read() then reports
