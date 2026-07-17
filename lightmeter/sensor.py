@@ -47,6 +47,8 @@ SATURATION_VOLTAGE = 3.2  # V
 # 3.3 V × 270 Ω / (13 kΩ + 270 Ω). Firmware persists a per-device override.
 DEFAULT_DARK_OFFSET_V = 3.3 * 270 / (13_000 + 270)
 MAX_DARK_OFFSET_V = 0.25
+# Avoid flash wear when an averaged dark measurement has not materially changed.
+DARK_OFFSET_WRITE_TOLERANCE_V = 0.0001
 
 
 def best_gain(max_voltage, headroom=0.85):
@@ -633,8 +635,9 @@ class LightSensor:
     def set_device_dark_offset(self, offset_v):
         """Persist a per-device electrical dark correction in volts.
 
-        Valid offsets are finite values within ±0.25 V. Returns True only after
-        firmware acknowledges the flash write.
+        Valid offsets are finite values within ±0.25 V. Returns True after a
+        firmware-acknowledged write, or without writing when the saved value is
+        already within 100 µV of the requested offset.
         """
         try:
             offset = float(offset_v)
@@ -642,6 +645,8 @@ class LightSensor:
             return False
         if not math.isfinite(offset) or abs(offset) > MAX_DARK_OFFSET_V:
             return False
+        if abs(offset - self._device_dark_offset_v) <= DARK_OFFSET_WRITE_TOLERANCE_V:
+            return True
         with self._lock:
             if not self.connected:
                 self.open()

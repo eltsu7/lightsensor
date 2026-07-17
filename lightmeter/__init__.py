@@ -1,6 +1,7 @@
 """lightmeter — driver and GUI for the ESP32-C3 light sensor."""
 
 from lightmeter.sensor import (
+    DARK_OFFSET_WRITE_TOLERANCE_V,
     DEFAULT_DARK_OFFSET_V,
     MAX_DARK_OFFSET_V,
     Calibration,
@@ -19,6 +20,7 @@ __all__ = [
     "Calibration",
     "DeviceInfo",
     "LightSensor",
+    "DARK_OFFSET_WRITE_TOLERANCE_V",
     "DEFAULT_DARK_OFFSET_V",
     "MAX_DARK_OFFSET_V",
     "Reading",

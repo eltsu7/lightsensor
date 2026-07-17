@@ -25,7 +25,7 @@ BPW34 → OPA323 → ADS1115 → ESP32-C3 firmware → USB-CDC protocol v2
 - Firmware owns the gain table and saturation voltage; hosts mirror them only for conversion and mismatch warnings.
 - Preserve two distinct saturation modes: sensor rail saturation at high full-scale gains versus ADC-count saturation at lower full-scale gains.
 - Firmware-side autogain is authoritative: with autogain enabled, each read settles in the 40–90% full-scale band before averaging; a manual gain command disables it. Hosts record the returned gain and never calculate exposure steps.
-- Store/record **volts**, never gain-relative percent. Apply the active dark correction last for display; it must not affect autogain or saturation decisions. Firmware persists a device baseline (default `0.067144 V` from R1/R3); session `zero()` overrides it and `clear_zero()` restores it.
+- Store/record **volts**, never gain-relative percent. Apply the active dark correction last for display; it must not affect autogain or saturation decisions. Firmware persists a device baseline (default `0.067144 V` from R1/R3); session `zero()` overrides it and `clear_zero()` restores it. Skip persistent writes when the requested value is within `100 µV`.
 - Calibration transfers are CRC32-verified and throttled: Python sends flushed 128-byte chunks with short pauses. Do not replace this with one bulk write.
 - On an interrupted/desynchronized calibration write, remain silent through the device timeout (up to 5 s); a ping resets the firmware payload timeout.
 

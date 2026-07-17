@@ -30,6 +30,8 @@ pub const SATURATION_VOLTAGE: f64 = 3.2;
 /// Nominal R1/R3 electrical dark baseline: 3.3 V × 270 Ω / (13 kΩ + 270 Ω).
 pub const DEFAULT_DARK_OFFSET_V: f64 = 3.3 * 270.0 / (13_000.0 + 270.0);
 pub const MAX_DARK_OFFSET_V: f64 = 0.25;
+/// Skip flash writes when a measured dark level changed by no more than 100 µV.
+pub const DARK_OFFSET_WRITE_TOLERANCE_V: f64 = 0.0001;
 
 /// Highest gain index that keeps `max_voltage` below saturation with the
 /// given headroom (default 0.85). Falls back to 0 (widest range).
@@ -314,10 +316,14 @@ impl<T: Transport> LightSensor<T> {
 
     /// Persist a per-device electrical dark correction in volts.
     ///
-    /// Returns `Ok(true)` only after firmware acknowledges the flash write.
+    /// Returns `Ok(true)` after a firmware-acknowledged write, or without
+    /// writing when the saved value is already within 100 µV.
     pub fn set_device_dark_offset(&mut self, offset: f64) -> Result<bool> {
         if !offset.is_finite() || offset.abs() > MAX_DARK_OFFSET_V {
             return Ok(false);
+        }
+        if (offset - self.device_dark_offset_v).abs() <= DARK_OFFSET_WRITE_TOLERANCE_V {
+            return Ok(true);
         }
         self.transport.send(format!("d{offset:.9}\n").as_bytes())?;
         let response = self.transport.read_line()?.unwrap_or_default();

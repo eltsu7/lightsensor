@@ -17,8 +17,10 @@ both speak the same serial protocol.
   gain-relative percentages, so a session survives gain changes intact.
 - **Device dark correction + session zeroing.** Firmware persists a per-device
   electrical baseline (default: the calculated 67.144 mV R1/R3 divider value);
-  a temporary zero can override it for the current background. Saturation flags
-  (op-amp rail vs. ADC overflow) remain firmware-reported and mutually exclusive.
+  the GUI can save a covered-sensor reading as that device value, avoiding a flash
+  write when it is within 100 µV of the saved correction. A temporary zero can
+  override it for the current background. Saturation flags (op-amp rail vs. ADC
+  overflow) remain firmware-reported and mutually exclusive.
 - **On-device calibration storage**: a spectral responsivity curve travels
   with the sensor (LittleFS, CRC32-verified transfer). The Python driver uses it
   for physical-unit conversion; the Rust driver currently exposes raw values and volts.

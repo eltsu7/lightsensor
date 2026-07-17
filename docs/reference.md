@@ -63,7 +63,8 @@ lands in-band (no oscillation).
   LittleFS and reports it as `dark` in `I`. The default is the calculated
   R1/R3 divider baseline, `3.3 × 270 / (13000 + 270) = 0.067144 V`.
   `d<volts>\n` updates the value after validating the ±0.25 V range; `D`
-  reads it. This is not an automatic darkness measurement.
+  reads it. Drivers skip the flash write when the requested value is within
+  100 µV of the saved value. This is not an automatic darkness measurement.
 
 ## Driver API (`lightmeter/sensor.py`)
 
@@ -84,8 +85,8 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | `read()` | Returns `Reading` or `None` |
 | `gain` / `set_gain(i)` / `get_gain()` | Applied gain index (tracked locally, from the device's `r` reply) / set (also disables autogain on the device) / query device |
 | `autogain` / `set_autogain(enabled)` / `get_autogain()` | Local mirror of firmware autoexposure state / enable-disable (`a1`/`a0`) / query device state + gain (`A`) |
-| `device_dark_offset_v` / `set_device_dark_offset(v)` / `reset_device_dark_offset()` | Persisted device electrical correction / update / restore the calculated 0.067144 V divider baseline |
-| `calibrate_device_dark_offset(n=200)` | Measure the covered sensor uncorrected and persist that device value; returns volts or `None` |
+| `device_dark_offset_v` / `set_device_dark_offset(v)` / `reset_device_dark_offset()` | Persisted device electrical correction / update (skips writes within 100 µV) / restore the calculated 0.067144 V divider baseline |
+| `calibrate_device_dark_offset(n=200)` | Measure the covered sensor uncorrected and persist it unless it matches the saved value within 100 µV; returns volts or `None` |
 | `zero(n=50)` / `clear_zero()` / `session_zero_offset_v` / `zero_offset` | Temporary background zero / clear it / session value / active correction; clearing restores the device offset |
 | `average` | ADC samples the firmware averages per `read()` (default 1; ~√n noise, ×n time) |
 | `info` / `ping()` / `identify()` / `connected` | Identity from handshake / link check / query / port state |

@@ -7,6 +7,7 @@ import os
 import tomllib
 
 from lightmeter.sensor import (
+    DARK_OFFSET_WRITE_TOLERANCE_V,
     DEFAULT_DARK_OFFSET_V,
     DEFAULT_GAIN,
     GAIN_VOLTAGES,
@@ -197,6 +198,12 @@ def bare_sensor(device_offset=DEFAULT_DARK_OFFSET_V):
 
 def test_default_dark_offset_matches_schematic_divider():
     assert approx(DEFAULT_DARK_OFFSET_V, 3.3 * 270 / (13_000 + 270))
+
+
+def test_matching_device_dark_offset_skips_flash_write():
+    sensor = bare_sensor(0.067)
+    assert sensor.set_device_dark_offset(0.067)
+    assert sensor.set_device_dark_offset(0.067 + DARK_OFFSET_WRITE_TOLERANCE_V / 2)
 
 
 def test_session_zero_overrides_and_clears_to_device_offset():

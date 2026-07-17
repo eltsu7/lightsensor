@@ -25,6 +25,7 @@ pub struct SimTransport {
     autogain: bool,
     replies: VecDeque<String>,
     dark_offset_v: f64,
+    dark_offset_writes: usize,
     rng: u64,
     /// When set, the device plays dead (tests the resync path).
     pub mute: bool,
@@ -40,6 +41,7 @@ impl Default for SimTransport {
             replies: VecDeque::new(),
             rng: 0x1234_5678_9ABC_DEF0,
             dark_offset_v: DEFAULT_DARK_OFFSET_V,
+            dark_offset_writes: 0,
             mute: false,
         }
     }
@@ -52,6 +54,10 @@ impl SimTransport {
 
     pub fn autogain(&self) -> bool {
         self.autogain
+    }
+
+    pub fn dark_offset_writes(&self) -> usize {
+        self.dark_offset_writes
     }
 
     fn noise(&mut self) -> f64 {
@@ -150,6 +156,7 @@ impl SimTransport {
             _ if cmd.starts_with('d') => match cmd[1..].trim().parse::<f64>() {
                 Ok(offset) if offset.is_finite() && offset.abs() <= MAX_DARK_OFFSET_V => {
                     self.dark_offset_v = offset;
+                    self.dark_offset_writes += 1;
                     "ok".to_string()
                 }
                 _ => "err 1".to_string(),

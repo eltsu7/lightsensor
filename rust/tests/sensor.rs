@@ -13,8 +13,8 @@ use std::time::Instant;
 use lightmeter::sim::SimTransport;
 use lightmeter::transport::Result as TResult;
 use lightmeter::{
-    DEFAULT_DARK_OFFSET_V, DEFAULT_GAIN, GAIN_VOLTAGES, LightSensor, PROTO_VERSION, Reading,
-    SATURATION_VOLTAGE, Transport, best_gain, parse_identity,
+    DARK_OFFSET_WRITE_TOLERANCE_V, DEFAULT_DARK_OFFSET_V, DEFAULT_GAIN, GAIN_VOLTAGES, LightSensor,
+    PROTO_VERSION, Reading, SATURATION_VOLTAGE, Transport, best_gain, parse_identity,
 };
 
 const HEADROOM: f64 = 0.85;
@@ -36,6 +36,10 @@ impl SharedSim {
     }
     fn autogain(&self) -> bool {
         self.0.borrow().autogain()
+    }
+
+    fn dark_offset_writes(&self) -> usize {
+        self.0.borrow().dark_offset_writes()
     }
 }
 
@@ -292,7 +296,19 @@ fn zero_measures_offset_and_subtracts_it() {
 fn device_dark_offset_persists_and_session_zero_overrides_it() {
     let (mut s, sim) = sensor_with(0.1, 0.0);
     assert!((s.device_dark_offset() - DEFAULT_DARK_OFFSET_V).abs() < 1e-6);
+    assert_eq!(sim.dark_offset_writes(), 0);
+    assert!(s.set_device_dark_offset(DEFAULT_DARK_OFFSET_V).unwrap());
+    assert!(
+        s.set_device_dark_offset(DEFAULT_DARK_OFFSET_V + DARK_OFFSET_WRITE_TOLERANCE_V / 2.0)
+            .unwrap()
+    );
+    assert_eq!(
+        sim.dark_offset_writes(),
+        0,
+        "matching dark values must not wear flash"
+    );
     assert!(s.set_device_dark_offset(0.08).unwrap());
+    assert_eq!(sim.dark_offset_writes(), 1);
     assert!((s.device_dark_offset() - 0.08).abs() < 1e-12);
 
     let session = s.zero(5).unwrap();
