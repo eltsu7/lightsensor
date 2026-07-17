@@ -683,6 +683,17 @@ class LightSensor:
                 self.set_autogain(True)
         return offset if offset is not None and self.set_device_dark_offset(offset) else None
 
+    def save_session_dark_offset(self):
+        """Persist the existing session dark/background correction.
+
+        Returns False when no session zero has been measured. The value is
+        otherwise passed unchanged to set_device_dark_offset(), including its
+        flash-write guard.
+        """
+        if self._session_zero_offset_v is None:
+            return False
+        return self.set_device_dark_offset(self._session_zero_offset_v)
+
     def zero(self, n=50):
         """Temporarily zero the current dark/background level over n samples.
 

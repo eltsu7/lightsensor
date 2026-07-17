@@ -346,6 +346,16 @@ impl<T: Transport> LightSensor<T> {
         self.set_device_dark_offset(DEFAULT_DARK_OFFSET_V)
     }
 
+    /// Persist the existing session dark/background correction.
+    ///
+    /// Returns `Ok(false)` when no session zero is active.
+    pub fn save_session_dark_offset(&mut self) -> Result<bool> {
+        let Some(offset) = self.session_zero_offset_v else {
+            return Ok(false);
+        };
+        self.set_device_dark_offset(offset)
+    }
+
     /// Measure covered-sensor dark voltage and persist it on the device.
     ///
     /// Autogain and session zeroing are suspended while sampling the true

@@ -59,9 +59,10 @@ class SensorSampler:
         self._autogain_applied = None      # device state; None forces (re)apply
         self._zero_request = 0  # n samples to zero over (0 = no request)
         self._clear_zero_req = False
-        self._save_device_dark_request = 0
+        self._save_device_dark_request = False
         self._zeroing = False
         self._zeroed = False
+        self._session_zeroed = False
         self._zero_offset_v = 0.0
         self._rate_window = deque()  # recent sample times for sps calc
         self._average = 1  # firmware-side samples averaged per read
@@ -127,9 +128,9 @@ class SensorSampler:
     def request_clear_zero(self):
         self._clear_zero_req = True
 
-    def save_device_dark_offset(self, n=50):
-        """Request a covered-sensor measurement persisted by the sampler thread."""
-        self._save_device_dark_request = n
+    def save_session_dark_offset(self):
+        """Request persistence of the existing session dark offset."""
+        self._save_device_dark_request = True
 
     def set_average(self, n):
         """Set the number of ADC samples the firmware averages per read."""
@@ -179,6 +180,10 @@ class SensorSampler:
     @property
     def zeroed(self):
         return self._zeroed
+
+    @property
+    def session_zeroed(self):
+        return self._session_zeroed
 
     @property
     def zero_offset(self):
@@ -249,6 +254,7 @@ class SensorSampler:
                     self.status = "connected"
                     self._zeroed = sensor.is_zeroed
                     self._zero_offset_v = sensor.zero_offset
+                    self._session_zeroed = sensor.session_zero_offset_v is not None
 
                 sensor.average = self._average
                 if self._clear_zero_req:
@@ -256,6 +262,7 @@ class SensorSampler:
                     sensor.clear_zero()
                     self._zeroed = sensor.is_zeroed
                     self._zero_offset_v = sensor.zero_offset
+                    self._session_zeroed = False
                 if self._zero_request > 0:
                     n = self._zero_request
                     self._zero_request = 0
@@ -264,23 +271,20 @@ class SensorSampler:
                         sensor.zero(n)
                         self._zeroed = sensor.is_zeroed
                         self._zero_offset_v = sensor.zero_offset
+                        self._session_zeroed = sensor.session_zero_offset_v is not None
                     finally:
                         self._zeroing = False
                     self._skip_next = True
                     continue
-                if self._save_device_dark_request > 0:
-                    n = self._save_device_dark_request
-                    self._save_device_dark_request = 0
-                    self._zeroing = True
-                    try:
-                        offset = sensor.calibrate_device_dark_offset(n)
-                        self._zeroed = sensor.is_zeroed
-                        self._zero_offset_v = sensor.zero_offset
-                        self.status = "device dark saved" if offset is not None else "device dark save failed"
-                    finally:
-                        self._zeroing = False
-                    self._skip_next = True
-                    continue
+                if self._save_device_dark_request:
+                    self._save_device_dark_request = False
+                    if sensor.save_session_dark_offset():
+                        self.status = "session dark saved to device"
+                    else:
+                        self.status = "no session dark to save"
+                    self._zeroed = sensor.is_zeroed
+                    self._session_zeroed = sensor.session_zero_offset_v is not None
+                    self._zero_offset_v = sensor.zero_offset
                 # Manual gain (only when autogain is off; a manual gain also
                 # turns autoexposure off on the device).
                 if not self._autogain_continuous and self._desired_gain != self._applied_gain:
@@ -535,9 +539,13 @@ class SensorApp:
         ttk.Button(zero, text="Clear session zero", command=self._clear_zero).pack(
             side=tk.TOP, fill=tk.X, pady=(4, 0)
         )
-        ttk.Button(zero, text="Save as device dark", command=self._save_device_dark).pack(
-            side=tk.TOP, fill=tk.X, pady=(4, 0)
+        self._save_dark_btn = ttk.Button(
+            zero,
+            text="Save session dark to device",
+            command=self._save_device_dark,
+            state=tk.DISABLED,
         )
+        self._save_dark_btn.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
 
         # Acquisition section
         acq = section("Acquisition")
@@ -664,7 +672,7 @@ class SensorApp:
         self.sampler.request_clear_zero()
 
     def _save_device_dark(self):
-        self.sampler.save_device_dark_offset(50)
+        self.sampler.save_session_dark_offset()
 
     def _apply_gain(self):
         gain_index = GAIN_LABELS.index(self.gain_var.get())
@@ -786,6 +794,7 @@ class SensorApp:
         # Display the active correction; a session zero overrides the persisted
         # device baseline and clearing it restores that baseline.
         self._zero_btn.config(text=f"Zero background: {self.sampler.zero_offset:.4f} V")
+        self._save_dark_btn.state(["!disabled"] if self.sampler.session_zeroed else ["disabled"])
 
         # Sample-rate / activity indicator.
         rate = self.sampler.sample_rate

@@ -297,6 +297,7 @@ fn device_dark_offset_persists_and_session_zero_overrides_it() {
     let (mut s, sim) = sensor_with(0.1, 0.0);
     assert!((s.device_dark_offset() - DEFAULT_DARK_OFFSET_V).abs() < 1e-6);
     assert_eq!(sim.dark_offset_writes(), 0);
+    assert!(!s.save_session_dark_offset().unwrap());
     assert!(s.set_device_dark_offset(DEFAULT_DARK_OFFSET_V).unwrap());
     assert!(
         s.set_device_dark_offset(DEFAULT_DARK_OFFSET_V + DARK_OFFSET_WRITE_TOLERANCE_V / 2.0)
@@ -314,11 +315,14 @@ fn device_dark_offset_persists_and_session_zero_overrides_it() {
     let session = s.zero(5).unwrap();
     assert!((session - 0.1).abs() < 1e-3);
     assert_eq!(s.session_zero_offset(), Some(session));
+    assert!(s.save_session_dark_offset().unwrap());
+    assert_eq!(sim.dark_offset_writes(), 2);
+    assert!((s.device_dark_offset() - session).abs() < 1e-12);
     s.clear_zero();
     assert_eq!(s.session_zero_offset(), None);
-    assert!((s.zero_offset() - 0.08).abs() < 1e-12);
+    assert!((s.zero_offset() - session).abs() < 1e-12);
 
-    sim.set_level(0.08);
+    sim.set_level(session);
     assert!(read_value(&mut s).abs() < 0.02);
     assert!(s.reset_device_dark_offset().unwrap());
     assert!((s.device_dark_offset() - DEFAULT_DARK_OFFSET_V).abs() < 1e-12);

@@ -86,7 +86,8 @@ flags are mutually exclusive on this hardware (see gain mapping above).
 | `gain` / `set_gain(i)` / `get_gain()` | Applied gain index (tracked locally, from the device's `r` reply) / set (also disables autogain on the device) / query device |
 | `autogain` / `set_autogain(enabled)` / `get_autogain()` | Local mirror of firmware autoexposure state / enable-disable (`a1`/`a0`) / query device state + gain (`A`) |
 | `device_dark_offset_v` / `set_device_dark_offset(v)` / `reset_device_dark_offset()` | Persisted device electrical correction / update (skips writes within 100 µV) / restore the calculated 0.067144 V divider baseline |
-| `calibrate_device_dark_offset(n=200)` | Measure the covered sensor uncorrected and persist it unless it matches the saved value within 100 µV; returns volts or `None` |
+| `calibrate_device_dark_offset(n=200)` | Directly measure the covered sensor uncorrected and persist it unless it matches the saved value within 100 µV; returns volts or `None` |
+| `save_session_dark_offset()` | Persist the existing `zero()` measurement; returns `False` when no session zero is active |
 | `zero(n=50)` / `clear_zero()` / `session_zero_offset_v` / `zero_offset` | Temporary background zero / clear it / session value / active correction; clearing restores the device offset |
 | `average` | ADC samples the firmware averages per `read()` (default 1; ~√n noise, ×n time) |
 | `info` / `ping()` / `identify()` / `connected` | Identity from handshake / link check / query / port state |

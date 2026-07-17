@@ -216,6 +216,16 @@ def test_session_zero_overrides_and_clears_to_device_offset():
     assert approx(sensor.zero_offset, 0.067)
 
 
+def test_session_dark_save_persists_existing_session_value():
+    sensor = bare_sensor(0.067)
+    assert sensor.save_session_dark_offset() is False
+    sensor._session_zero_offset_v = 0.080
+    saved = []
+    sensor.set_device_dark_offset = lambda offset: saved.append(offset) or True
+    assert sensor.save_session_dark_offset() is True
+    assert saved == [0.080]
+
+
 def test_dark_offset_is_applied_last_without_changing_saturation_flags():
     sensor = bare_sensor(0.067)
     raw = 10_000
