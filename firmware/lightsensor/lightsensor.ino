@@ -1,400 +1,1239 @@
-// LightSensor firmware for the ESP32-C3 SuperMini.
-// Native USB CDC is used for Serial (build with CDCOnBoot=cdc).
+// LightSensor v3 production firmware for the RP2040/ADS1220 board.
+// Native USB CDC carries binary protocol v3 frames.
 
-#include <Wire.h>
-#include <Adafruit_ADS1X15.h>
+#include <Arduino.h>
 #include <LittleFS.h>
+#include <SPI.h>
+#include <USB.h>
+#include <Wire.h>
+#include <cmath>
+#include <hardware/flash.h>
+#include <pico/time.h>
 
-// Protocol/firmware identity. Bump PROTO_VERSION on any breaking change to the
-// serial command set or response formats; bump FW_VERSION for any release.
-#define PROTO_VERSION 2
-#define FW_VERSION "2.1.0"
+namespace {
 
-// Error codes returned as "err <code>" by command-style responses. 0 is never
-// emitted (success uses "ok"). Keep in sync with lightsensor.py ERR_*.
-//   1 bad argument        4 transfer timeout / short read
-//   2 bad length          5 filesystem open failed
-//   3 out of memory       6 write size mismatch
-//   7 erase failed
-#define ERR_BAD_ARG  1
-#define ERR_BAD_LEN  2
-#define ERR_NO_MEM   3
-#define ERR_TIMEOUT  4
-#define ERR_FS_OPEN  5
-#define ERR_WRITE    6
-#define ERR_ERASE    7
+constexpr uint8_t PROTOCOL_VERSION = 3;
+constexpr uint8_t FIRMWARE_MAJOR = 3;
+constexpr uint8_t FIRMWARE_MINOR = 0;
+constexpr uint8_t FIRMWARE_PATCH = 0;
+constexpr uint8_t HARDWARE_MAJOR = 3;
 
-void sendErr(int code) {
-  Serial.print("err ");
-  Serial.println(code);
-}
+constexpr uint8_t ADC_MISO = 0;
+constexpr uint8_t ADC_CS = 1;
+constexpr uint8_t ADC_SCK = 2;
+constexpr uint8_t ADC_MOSI = 3;
+constexpr uint8_t ADC_DRDY = 4;
+constexpr uint8_t TMP_SDA = 10;
+constexpr uint8_t TMP_SCL = 11;
+constexpr uint8_t TMP_ADDRESS = 0x48;
 
-// Calibration blob (spectral responsivity CSV + metadata header) lives in a
-// LittleFS file. The host writes/reads it whole; integrity is checked with a
-// CRC32 (standard reflected poly, matches Python's binascii.crc32).
-const char* CAL_PATH = "/cal.csv";
+constexpr uint32_t ADC_SPI_HZ = 1'000'000;
+constexpr float ADC_REFERENCE_V = 2.048f;
+constexpr int32_t ADC_POSITIVE_FULL_SCALE = 8'388'607;
+constexpr int32_t ADC_NEGATIVE_FULL_SCALE = -8'388'608;
+constexpr int32_t AUTOGAIN_LOW_CODE = 3'355'442;   // 40% of positive full scale.
+constexpr int32_t AUTOGAIN_HIGH_CODE = 7'130'316;  // 85% of positive full scale.
+constexpr int32_t TIA_POSITIVE_CLIP_CODE_GAIN_1 = 6'717'440;  // 1.64 V.
+constexpr float TIA_POSITIVE_CLIP_V = 1.64f;
+constexpr float DARK_LIMIT_V = 0.25f;
+constexpr uint32_t ADC_TIMEOUT_US = 300'000;
+constexpr uint32_t TEMPERATURE_PERIOD_US = 100'000;
+constexpr uint32_t STREAM_ACK_TIMEOUT_MS = 1'000;
 
-// Per-device electrical dark baseline. The nominal value is the R1/R3 divider:
-// 3.3 V × 270 Ω / (13 kΩ + 270 Ω). A calibrated value overrides it in LittleFS.
-const char* DARK_OFFSET_PATH = "/dark_offset_v";
-const float DEFAULT_DARK_OFFSET_V = 3.3f * 270.0f / (13000.0f + 270.0f);
-const float DARK_OFFSET_LIMIT_V = 0.25f;
+constexpr uint8_t ADS_CMD_RESET = 0x06;
+constexpr uint8_t ADS_CMD_START_SYNC = 0x08;
+constexpr uint8_t ADS_CMD_POWERDOWN = 0x02;
+constexpr uint8_t ADS_CMD_RREG = 0x20;
+constexpr uint8_t ADS_CMD_WREG = 0x40;
 
-// Running CRC32 (no final XOR until done). Feed bytes incrementally.
-uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
+constexpr size_t MAX_DECODED_FRAME = 256;
+constexpr size_t MAX_PAYLOAD = 248;
+constexpr size_t MAX_ENCODED_FRAME = 258;
+constexpr size_t MAX_WINDOW = 1024;
+
+constexpr char DARK_PATH[] = "/dark.bin";
+constexpr char DARK_TEMP_PATH[] = "/dark.tmp";
+constexpr uint16_t PERSISTENCE_SCHEMA = 1;
+constexpr uint16_t PERSISTENCE_KIND_DARK = 1;
+constexpr size_t DARK_RECORD_SIZE = 20;
+
+constexpr uint32_t CAP_RAW_STREAM = 1u << 0;
+constexpr uint32_t CAP_VOLTS_STREAM = 1u << 1;
+constexpr uint32_t CAP_FINITE_STREAM = 1u << 2;
+constexpr uint32_t CAP_VOLTS_AUTOGAIN = 1u << 3;
+constexpr uint32_t CAP_TEMPERATURE = 1u << 4;
+constexpr uint32_t CAP_SESSION_DARK = 1u << 5;
+constexpr uint32_t CAP_PERSISTENT_DARK = 1u << 6;
+constexpr uint32_t CAP_STORAGE_RESET = 1u << 7;
+constexpr uint32_t CAPABILITIES = CAP_RAW_STREAM | CAP_VOLTS_STREAM | CAP_FINITE_STREAM
+  | CAP_VOLTS_AUTOGAIN | CAP_TEMPERATURE | CAP_SESSION_DARK
+  | CAP_PERSISTENT_DARK | CAP_STORAGE_RESET;
+
+enum MessageType : uint8_t {
+  MSG_HELLO = 0x01,
+  MSG_TIME_SYNC = 0x02,
+  MSG_PING = 0x03,
+  MSG_GET_STATUS = 0x04,
+  MSG_LIST_PROFILES = 0x05,
+  MSG_START_STREAM = 0x10,
+  MSG_ACK_STREAM = 0x11,
+  MSG_STOP_STREAM = 0x12,
+  MSG_SET_SESSION_DARK = 0x20,
+  MSG_CLEAR_SESSION_DARK = 0x21,
+  MSG_SAVE_SESSION_DARK = 0x22,
+  MSG_RESET_STORAGE = 0x30,
+
+  MSG_HELLO_REPLY = 0x81,
+  MSG_TIME_SYNCED = 0x82,
+  MSG_PONG = 0x83,
+  MSG_STATUS = 0x84,
+  MSG_PROFILES = 0x85,
+  MSG_STREAM_STARTED = 0x90,
+  MSG_SAMPLE_RAW = 0x91,
+  MSG_SAMPLE_VOLTS = 0x92,
+  MSG_STREAM_STOPPED = 0x93,
+  MSG_OK = 0xA0,
+  MSG_ERROR = 0xFF,
+};
+
+enum ErrorCode : uint16_t {
+  ERR_BAD_FRAME = 1,
+  ERR_BAD_VERSION = 2,
+  ERR_BAD_SCHEMA = 3,
+  ERR_BAD_CRC = 4,
+  ERR_UNKNOWN_TYPE = 5,
+  ERR_BAD_ARGUMENT = 6,
+  ERR_BAD_STATE = 7,
+  ERR_TIME_NOT_SYNCED = 8,
+  ERR_ACK_TIMEOUT = 9,
+  ERR_ADC_CONFIG = 10,
+  ERR_ADC_TIMEOUT = 11,
+  ERR_OVERFLOW = 12,
+  ERR_TEMPERATURE = 13,
+  ERR_STORAGE_MOUNT = 14,
+  ERR_STORAGE_INTEGRITY = 15,
+  ERR_STORAGE_WRITE = 16,
+  ERR_STORAGE_CONFIRMATION = 17,
+  ERR_INTERNAL = 18,
+};
+
+enum DeviceState : uint8_t {
+  STATE_STOPPED = 0,
+  STATE_AWAITING_ACK = 1,
+  STATE_STREAMING = 2,
+};
+
+enum StorageState : uint8_t {
+  STORAGE_EMPTY = 0,
+  STORAGE_VALID = 1,
+  STORAGE_FAULT = 2,
+};
+
+enum StreamFormat : uint8_t {
+  FORMAT_RAW = 0,
+  FORMAT_VOLTS = 1,
+};
+
+enum StreamMode : uint8_t {
+  MODE_CONTINUOUS = 0,
+  MODE_FINITE = 1,
+};
+
+enum StopReason : uint8_t {
+  STOP_REQUESTED = 0,
+  STOP_FINITE_COMPLETE = 1,
+  STOP_REPLACED = 2,
+};
+
+enum StatusFlag : uint8_t {
+  STATUS_ADC_POSITIVE_CLIP = 1u << 0,
+  STATUS_ADC_NEGATIVE_CLIP = 1u << 1,
+  STATUS_TIA_POSITIVE_CLIP = 1u << 2,
+  STATUS_AUTOGAIN_OVERRANGE = 1u << 4,
+  STATUS_AUTOGAIN_UNDERRANGE = 1u << 5,
+};
+
+struct Profile {
+  uint8_t id;
+  const char *name;
+  uint8_t register1;
+  uint8_t register2;
+  uint32_t measuredMilliSps;
+};
+
+constexpr Profile PROFILES[] = {
+  {0, "normal_20_50_60", 0x04, 0x10, 19'958},
+  {1, "normal_330", 0x84, 0x00, 327'876},
+  {2, "turbo_2000", 0xD4, 0x00, 1'949'300},
+};
+constexpr size_t PROFILE_COUNT = sizeof(PROFILES) / sizeof(PROFILES[0]);
+
+struct StreamConfig {
+  uint8_t format;
+  uint8_t mode;
+  uint8_t profileId;
+  uint8_t gainIndex;
+  uint8_t autogain;
+  uint16_t window;
+  uint32_t outputCount;
+};
+
+class BufferWriter {
+ public:
+  BufferWriter(uint8_t *data, size_t capacity) : data_(data), capacity_(capacity) {}
+
+  void putU8(uint8_t value) {
+    if (position_ < capacity_) data_[position_++] = value;
+    else ok_ = false;
+  }
+
+  void putU16(uint16_t value) {
+    putU8(static_cast<uint8_t>(value));
+    putU8(static_cast<uint8_t>(value >> 8));
+  }
+
+  void putU32(uint32_t value) {
+    for (uint8_t shift = 0; shift < 32; shift += 8) putU8(static_cast<uint8_t>(value >> shift));
+  }
+
+  void putU64(uint64_t value) {
+    for (uint8_t shift = 0; shift < 64; shift += 8) putU8(static_cast<uint8_t>(value >> shift));
+  }
+
+  void putF32(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    putU32(bits);
+  }
+
+  void putBytes(const uint8_t *bytes, size_t length) {
+    for (size_t i = 0; i < length; i++) putU8(bytes[i]);
+  }
+
+  void putText(const char *text) {
+    putBytes(reinterpret_cast<const uint8_t *>(text), strlen(text));
+  }
+
+  bool ok() const { return ok_; }
+  size_t size() const { return position_; }
+
+ private:
+  uint8_t *data_;
+  size_t capacity_;
+  size_t position_ = 0;
+  bool ok_ = true;
+};
+
+class BufferReader {
+ public:
+  BufferReader(const uint8_t *data, size_t length) : data_(data), length_(length) {}
+
+  uint8_t getU8() {
+    if (position_ >= length_) {
+      ok_ = false;
+      return 0;
+    }
+    return data_[position_++];
+  }
+
+  uint16_t getU16() {
+    uint16_t value = getU8();
+    value |= static_cast<uint16_t>(getU8()) << 8;
+    return value;
+  }
+
+  uint32_t getU32() {
+    uint32_t value = 0;
+    for (uint8_t shift = 0; shift < 32; shift += 8) value |= static_cast<uint32_t>(getU8()) << shift;
+    return value;
+  }
+
+  uint64_t getU64() {
+    uint64_t value = 0;
+    for (uint8_t shift = 0; shift < 64; shift += 8) value |= static_cast<uint64_t>(getU8()) << shift;
+    return value;
+  }
+
+  float getF32() {
+    uint32_t bits = getU32();
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+  }
+
+  bool matches(const char *text) {
+    size_t length = strlen(text);
+    if (position_ + length > length_) {
+      ok_ = false;
+      return false;
+    }
+    bool equal = memcmp(data_ + position_, text, length) == 0;
+    position_ += length;
+    return equal;
+  }
+
+  bool finished() const { return ok_ && position_ == length_; }
+  bool ok() const { return ok_; }
+
+ private:
+  const uint8_t *data_;
+  size_t length_;
+  size_t position_ = 0;
+  bool ok_ = true;
+};
+
+SPISettings adcSpiSettings(ADC_SPI_HZ, MSBFIRST, SPI_MODE1);
+volatile uint32_t drdyEvents = 0;
+volatile uint64_t lastDrdyTimestampUs = 0;
+
+uint8_t receiveEncoded[MAX_ENCODED_FRAME];
+size_t receiveEncodedLength = 0;
+bool receiveOverflow = false;
+uint8_t receiveDecoded[MAX_DECODED_FRAME];
+uint8_t transmitPayload[MAX_PAYLOAD];
+uint8_t transmitDecoded[MAX_DECODED_FRAME];
+uint8_t transmitEncoded[MAX_ENCODED_FRAME];
+
+uint8_t flashUniqueId[FLASH_UNIQUE_ID_SIZE_BYTES] = {};
+uint64_t deviceId = 0;
+char usbSerial[17] = {};
+
+DeviceState deviceState = STATE_STOPPED;
+StorageState storageState = STORAGE_EMPTY;
+bool filesystemMounted = false;
+bool adcReady = false;
+bool timeSynchronized = false;
+uint64_t synchronizedUtcUs = 0;
+uint64_t synchronizedMonotonicUs = 0;
+uint16_t lastErrorCode = 0;
+
+float deviceDarkVolts = 0.0f;
+bool sessionDarkActive = false;
+float sessionDarkVolts = 0.0f;
+float temperatureC = NAN;
+bool temperatureValid = false;
+uint64_t nextTemperatureUs = 0;
+
+StreamConfig streamConfig = {};
+uint64_t streamStartDeviceUs = 0;
+uint64_t streamStartUtcUs = 0;
+uint32_t streamSequence = 0;
+uint32_t deliveredOutputs = 0;
+uint32_t streamAckDeadlineMs = 0;
+uint64_t lastConversionActivityUs = 0;
+
+int32_t windowValues[MAX_WINDOW];
+uint16_t windowCount = 0;
+uint16_t windowPosition = 0;
+int64_t windowSum = 0;
+
+uint32_t crc32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < length; i++) {
     crc ^= data[i];
-    for (int k = 0; k < 8; k++)
-      crc = (crc >> 1) ^ (0xEDB88320UL & (-(int32_t)(crc & 1)));
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
   }
-  return crc;
+  return crc ^ 0xFFFFFFFFu;
 }
 
-bool isValidDarkOffset(float offset) {
-  return isfinite(offset) && offset >= -DARK_OFFSET_LIMIT_V && offset <= DARK_OFFSET_LIMIT_V;
-}
+size_t cobsEncode(const uint8_t *input, size_t length, uint8_t *output, size_t capacity) {
+  if (capacity == 0) return 0;
+  size_t readIndex = 0;
+  size_t writeIndex = 1;
+  size_t codeIndex = 0;
+  uint8_t code = 1;
 
-float readDarkOffset() {
-  File f = LittleFS.open(DARK_OFFSET_PATH, "r");
-  if (!f) return DEFAULT_DARK_OFFSET_V;
-  char text[32];
-  size_t n = f.readBytesUntil('\n', text, sizeof(text) - 1);
-  f.close();
-  text[n] = '\0';
-  char* end;
-  float offset = strtof(text, &end);
-  return end != text && *end == '\0' && isValidDarkOffset(offset)
-    ? offset
-    : DEFAULT_DARK_OFFSET_V;
-}
-
-bool writeDarkOffset(float offset) {
-  File f = LittleFS.open(DARK_OFFSET_PATH, "w");
-  if (!f) return false;
-  size_t written = f.print(offset, 9);
-  written += f.print('\n');
-  f.close();
-  return written > 1;
-}
-
-bool readDarkOffsetArgument(float* offset) {
-  char text[32];
-  size_t n = 0;
-  unsigned long t0 = millis();
-  while (millis() - t0 < 1000) {
-    if (Serial.available() <= 0) continue;
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') break;
-    if (n >= sizeof(text) - 1) return false;
-    text[n++] = c;
-    t0 = millis();
+  while (readIndex < length) {
+    if (input[readIndex] == 0) {
+      if (codeIndex >= capacity) return 0;
+      output[codeIndex] = code;
+      code = 1;
+      codeIndex = writeIndex++;
+      if (writeIndex > capacity) return 0;
+      readIndex++;
+    } else {
+      if (writeIndex >= capacity) return 0;
+      output[writeIndex++] = input[readIndex++];
+      code++;
+      if (code == 0xFF) {
+        if (codeIndex >= capacity) return 0;
+        output[codeIndex] = code;
+        code = 1;
+        codeIndex = writeIndex++;
+        if (writeIndex > capacity) return 0;
+      }
+    }
   }
-  text[n] = '\0';
-  char* end;
-  float value = strtof(text, &end);
-  if (end == text || *end != '\0' || !isValidDarkOffset(value)) return false;
-  *offset = value;
+  if (codeIndex >= capacity) return 0;
+  output[codeIndex] = code;
+  return writeIndex;
+}
+
+size_t cobsDecode(const uint8_t *input, size_t length, uint8_t *output, size_t capacity) {
+  size_t readIndex = 0;
+  size_t writeIndex = 0;
+  while (readIndex < length) {
+    uint8_t code = input[readIndex++];
+    if (code == 0) return 0;
+    size_t copyLength = static_cast<size_t>(code - 1);
+    if (readIndex + copyLength > length || writeIndex + copyLength > capacity) return 0;
+    for (size_t i = 0; i < copyLength; i++) output[writeIndex++] = input[readIndex++];
+    if (code != 0xFF && readIndex < length) {
+      if (writeIndex >= capacity) return 0;
+      output[writeIndex++] = 0;
+    }
+  }
+  return writeIndex;
+}
+
+bool sendFrame(uint8_t messageType, const uint8_t *payload, size_t payloadLength) {
+  if (payloadLength > MAX_PAYLOAD) return false;
+  BufferWriter writer(transmitDecoded, sizeof(transmitDecoded));
+  writer.putU8(PROTOCOL_VERSION);
+  writer.putU8(messageType);
+  writer.putU16(static_cast<uint16_t>(payloadLength));
+  writer.putBytes(payload, payloadLength);
+  if (!writer.ok()) return false;
+  uint32_t checksum = crc32(transmitDecoded, writer.size());
+  writer.putU32(checksum);
+  if (!writer.ok()) return false;
+  size_t encodedLength = cobsEncode(
+    transmitDecoded, writer.size(), transmitEncoded, sizeof(transmitEncoded)
+  );
+  if (encodedLength == 0) return false;
+  size_t written = Serial.write(transmitEncoded, encodedLength);
+  written += Serial.write(static_cast<uint8_t>(0));
+  return written == encodedLength + 1;
+}
+
+void adcSelect() {
+  SPI.beginTransaction(adcSpiSettings);
+  digitalWrite(ADC_CS, LOW);
+  delayMicroseconds(1);
+}
+
+void adcDeselect() {
+  digitalWrite(ADC_CS, HIGH);
+  SPI.endTransaction();
+}
+
+void adsCommand(uint8_t command) {
+  adcSelect();
+  SPI.transfer(command);
+  adcDeselect();
+}
+
+void adsReadRegisters(uint8_t registers[4]) {
+  adcSelect();
+  SPI.transfer(ADS_CMD_RREG | 0x03);
+  for (size_t i = 0; i < 4; i++) registers[i] = SPI.transfer(0x00);
+  adcDeselect();
+}
+
+void adsWriteRegisters(const uint8_t registers[4]) {
+  adcSelect();
+  SPI.transfer(ADS_CMD_WREG | 0x03);
+  for (size_t i = 0; i < 4; i++) SPI.transfer(registers[i]);
+  adcDeselect();
+}
+
+void clearDrdyEvents() {
+  noInterrupts();
+  drdyEvents = 0;
+  lastDrdyTimestampUs = 0;
+  interrupts();
+}
+
+void onAdcDrdy() {
+  lastDrdyTimestampUs = time_us_64();
+  drdyEvents++;
+}
+
+bool takeDrdyEvents(uint32_t &events, uint64_t &timestampUs) {
+  noInterrupts();
+  events = drdyEvents;
+  timestampUs = lastDrdyTimestampUs;
+  if (events > 0) drdyEvents = 0;
+  interrupts();
+  return events > 0;
+}
+
+int32_t adsReadRaw() {
+  adcSelect();
+  uint32_t raw = static_cast<uint32_t>(SPI.transfer(0x00)) << 16;
+  raw |= static_cast<uint32_t>(SPI.transfer(0x00)) << 8;
+  raw |= SPI.transfer(0x00);
+  adcDeselect();
+  if (raw & 0x0080'0000) raw |= 0xFF00'0000;
+  return static_cast<int32_t>(raw);
+}
+
+void stopAdc() {
+  adsCommand(ADS_CMD_POWERDOWN);
+  clearDrdyEvents();
+}
+
+bool configureAdc(uint8_t profileId, uint8_t gainIndex) {
+  if (profileId >= PROFILE_COUNT || gainIndex > 7) return false;
+  const Profile &profile = PROFILES[profileId];
+  uint8_t requested[4] = {
+    static_cast<uint8_t>((gainIndex & 0x07) << 1),
+    profile.register1,
+    profile.register2,
+    0x00,
+  };
+  stopAdc();
+  delayMicroseconds(100);
+  adsWriteRegisters(requested);
+  uint8_t actual[4];
+  adsReadRegisters(actual);
+  if (memcmp(requested, actual, sizeof(actual)) != 0) return false;
+  clearDrdyEvents();
+  adsCommand(ADS_CMD_START_SYNC);
+  lastConversionActivityUs = time_us_64();
   return true;
 }
 
-// ESP32-C3 SuperMini I2C pins (v3 wiring: SDA/SCL next to 3V3/GND).
-const int I2C_SDA = 4;
-const int I2C_SCL = 3;
-
-Adafruit_ADS1115 ads;
-
-// OPA323 output saturates ~34 mV below the 3.3 V supply rail.
-const float SENSOR_SAT_V = 3.2;
-
-adsGain_t gains[] = {
-  GAIN_TWOTHIRDS,  // 0: ±6.144V
-  GAIN_ONE,        // 1: ±4.096V
-  GAIN_TWO,        // 2: ±2.048V
-  GAIN_FOUR,       // 3: ±1.024V
-  GAIN_EIGHT,      // 4: ±0.512V
-  GAIN_SIXTEEN     // 5: ±0.256V
-};
-float gainVoltages[] = {6.144, 4.096, 2.048, 1.024, 0.512, 0.256};
-int currentGain = 1;
-// Autogain (autoexposure) mode. When on, `r` reads step the gain until the
-// signal is in-band, then average. Any manual `g<n>` turns it off.
-bool autoGain = false;
-// Autoexposure band on % of full scale: wider than the 2x adjacent-gain
-// ratio, so a single step always lands in-band (no oscillation).
-const float AUTOGAIN_LOW_PCT = 40.0;
-const float AUTOGAIN_HIGH_PCT = 90.0;
-
-void setup() {
-  Serial.setRxBufferSize(8192);  // headroom for bulk calibration uploads
-  Serial.begin(115200);
-  delay(300);  // let USB-CDC enumerate and the ADS1115 finish power-on
-  LittleFS.begin(true);  // format on first boot / corruption
-  Wire.begin(I2C_SDA, I2C_SCL);
-  ads.begin(0x48, &Wire);
-  ads.setGain(gains[currentGain]);
-  ads.setDataRate(RATE_ADS1115_860SPS);
+bool initializeAdc() {
+  adsCommand(ADS_CMD_RESET);
+  delayMicroseconds(500);
+  uint8_t registers[4];
+  adsReadRegisters(registers);
+  bool reset = registers[0] == 0 && registers[1] == 0
+    && registers[2] == 0 && registers[3] == 0;
+  adsCommand(ADS_CMD_POWERDOWN);
+  return reset;
 }
 
-// True if a raw sample overflows the ADC counter at the current gain.
-bool isAdcSat(int16_t raw) {
-  return raw >= 32767;
+bool writeTmpRegister(uint8_t address, uint16_t value) {
+  Wire1.beginTransmission(TMP_ADDRESS);
+  Wire1.write(address);
+  Wire1.write(static_cast<uint8_t>(value >> 8));
+  Wire1.write(static_cast<uint8_t>(value));
+  return Wire1.endTransmission() == 0;
 }
 
-// True if the op-amp output is near the supply rail. Only possible when the
-// gain full-scale exceeds SENSOR_SAT_V; otherwise the ADC overflows first.
-bool isSensorSat(int16_t raw) {
-  if (gainVoltages[currentGain] <= SENSOR_SAT_V) return false;
-  int16_t thr = (int16_t)(SENSOR_SAT_V / gainVoltages[currentGain] * 32767);
-  return raw >= thr;
+bool readTmpRegister(uint8_t address, uint16_t &value) {
+  Wire1.beginTransmission(TMP_ADDRESS);
+  Wire1.write(address);
+  if (Wire1.endTransmission(false) != 0) return false;
+  if (Wire1.requestFrom(TMP_ADDRESS, static_cast<uint8_t>(2)) != 2) return false;
+  value = static_cast<uint16_t>(Wire1.read()) << 8;
+  value |= static_cast<uint16_t>(Wire1.read());
+  return true;
 }
 
-// Step the gain (single samples) until the signal is in-band or a gain rail
-// (0 = widest, ngains-1 = most sensitive) is reached. Bounded by ngains.
-void autoExpose() {
-  int ngains = (int)(sizeof(gainVoltages) / sizeof(gainVoltages[0]));
-  for (int iter = 0; iter < ngains; iter++) {
-    int16_t raw = ads.readADC_SingleEnded(0);
-    float pct = (float)raw / 32767.0 * 100.0;
-    bool over = isSensorSat(raw) || isAdcSat(raw) || pct >= AUTOGAIN_HIGH_PCT;
-    bool under = pct < AUTOGAIN_LOW_PCT;
-    if (over && currentGain > 0) {
-      currentGain--;  // wider range, less sensitive
-      ads.setGain(gains[currentGain]);
-    } else if (under && currentGain < ngains - 1) {
-      currentGain++;  // narrower range, more sensitive
-      ads.setGain(gains[currentGain]);
-    } else {
-      break;  // in-band, or railed
+bool configureTemperature() {
+  uint16_t device;
+  uint16_t configuration;
+  return readTmpRegister(0x0F, device)
+    && (device & 0x0FFF) == 0x0117
+    && writeTmpRegister(0x01, 0x0000)
+    && readTmpRegister(0x01, configuration)
+    && configuration == 0x0000;
+}
+
+bool refreshTemperature() {
+  uint16_t raw;
+  if (!readTmpRegister(0x00, raw)) return false;
+  temperatureC = static_cast<int16_t>(raw) * 0.0078125f;
+  temperatureValid = std::isfinite(temperatureC)
+    && temperatureC >= -55.0f && temperatureC <= 150.0f;
+  return temperatureValid;
+}
+
+float activeDarkVolts() {
+  return sessionDarkActive ? sessionDarkVolts : deviceDarkVolts;
+}
+
+uint8_t activeDarkSource() {
+  return sessionDarkActive ? 1 : 0;
+}
+
+bool parseDarkRecord(const uint8_t record[DARK_RECORD_SIZE], float &value) {
+  if (memcmp(record, "LSV3", 4) != 0) return false;
+  BufferReader reader(record + 4, DARK_RECORD_SIZE - 4);
+  uint16_t schema = reader.getU16();
+  uint16_t kind = reader.getU16();
+  uint32_t payloadLength = reader.getU32();
+  value = reader.getF32();
+  uint32_t expectedCrc = reader.getU32();
+  return reader.finished()
+    && schema == PERSISTENCE_SCHEMA
+    && kind == PERSISTENCE_KIND_DARK
+    && payloadLength == sizeof(float)
+    && std::isfinite(value)
+    && fabsf(value) <= DARK_LIMIT_V
+    && crc32(record, DARK_RECORD_SIZE - sizeof(uint32_t)) == expectedCrc;
+}
+
+bool readDarkFile(const char *path, float &value) {
+  File file = LittleFS.open(path, "r");
+  if (!file || file.size() != DARK_RECORD_SIZE) {
+    if (file) file.close();
+    return false;
+  }
+  uint8_t record[DARK_RECORD_SIZE];
+  bool complete = file.read(record, sizeof(record)) == sizeof(record);
+  file.close();
+  return complete && parseDarkRecord(record, value);
+}
+
+void loadPersistence() {
+  deviceDarkVolts = 0.0f;
+  sessionDarkActive = false;
+  if (!filesystemMounted) {
+    storageState = STORAGE_FAULT;
+    return;
+  }
+  LittleFS.remove(DARK_TEMP_PATH);
+  if (!LittleFS.exists(DARK_PATH)) {
+    storageState = STORAGE_EMPTY;
+    return;
+  }
+  float value;
+  if (readDarkFile(DARK_PATH, value)) {
+    deviceDarkVolts = value;
+    storageState = STORAGE_VALID;
+  } else {
+    storageState = STORAGE_FAULT;
+  }
+}
+
+bool writeDarkFile(float value) {
+  if (!filesystemMounted || !std::isfinite(value) || fabsf(value) > DARK_LIMIT_V) return false;
+  uint8_t record[DARK_RECORD_SIZE];
+  BufferWriter writer(record, sizeof(record));
+  writer.putText("LSV3");
+  writer.putU16(PERSISTENCE_SCHEMA);
+  writer.putU16(PERSISTENCE_KIND_DARK);
+  writer.putU32(sizeof(float));
+  writer.putF32(value);
+  writer.putU32(crc32(record, DARK_RECORD_SIZE - sizeof(uint32_t)));
+  if (!writer.ok() || writer.size() != sizeof(record)) return false;
+
+  LittleFS.remove(DARK_TEMP_PATH);
+  File file = LittleFS.open(DARK_TEMP_PATH, "w");
+  if (!file) return false;
+  bool written = file.write(record, sizeof(record)) == sizeof(record);
+  file.flush();
+  file.close();
+  float verified;
+  if (!written || !readDarkFile(DARK_TEMP_PATH, verified) || verified != value) {
+    LittleFS.remove(DARK_TEMP_PATH);
+    return false;
+  }
+  if (!LittleFS.rename(DARK_TEMP_PATH, DARK_PATH)) {
+    LittleFS.remove(DARK_TEMP_PATH);
+    return false;
+  }
+  deviceDarkVolts = value;
+  storageState = STORAGE_VALID;
+  return true;
+}
+
+bool resetStorage() {
+  stopAdc();
+  bool formatted = LittleFS.format();
+  if (!formatted) return false;
+  filesystemMounted = LittleFS.begin();
+  if (!filesystemMounted) return false;
+  storageState = STORAGE_EMPTY;
+  deviceDarkVolts = 0.0f;
+  sessionDarkVolts = 0.0f;
+  sessionDarkActive = false;
+  return true;
+}
+
+void resetWindow() {
+  windowCount = 0;
+  windowPosition = 0;
+  windowSum = 0;
+}
+
+void addWindowValue(int32_t value) {
+  if (windowCount < streamConfig.window) {
+    windowValues[windowPosition] = value;
+    windowSum += value;
+    windowCount++;
+  } else {
+    windowSum -= windowValues[windowPosition];
+    windowValues[windowPosition] = value;
+    windowSum += value;
+  }
+  windowPosition = (windowPosition + 1) % streamConfig.window;
+}
+
+bool windowReady() {
+  return windowCount == streamConfig.window;
+}
+
+void writeStreamConfig(BufferWriter &writer, const StreamConfig &config) {
+  writer.putU8(config.format);
+  writer.putU8(config.mode);
+  writer.putU8(config.profileId);
+  writer.putU8(config.gainIndex);
+  writer.putU8(config.autogain);
+  writer.putU16(config.window);
+  writer.putU32(config.outputCount);
+}
+
+bool sendOk(uint32_t requestId, uint8_t operation) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU8(operation);
+  return writer.ok() && sendFrame(MSG_OK, transmitPayload, writer.size());
+}
+
+void sendErrorFrame(
+  uint32_t requestId,
+  uint16_t errorCode,
+  uint16_t detail,
+  uint64_t token,
+  uint32_t lastSequence
+) {
+  lastErrorCode = errorCode;
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU64(token);
+  writer.putU32(lastSequence);
+  writer.putU16(errorCode);
+  writer.putU16(detail);
+  if (writer.ok()) sendFrame(MSG_ERROR, transmitPayload, writer.size());
+}
+
+uint32_t lastEmittedSequence() {
+  return deliveredOutputs == 0 ? UINT32_MAX : streamSequence - 1;
+}
+
+void fail(uint32_t requestId, uint16_t errorCode, uint16_t detail = 0) {
+  uint64_t token = streamStartDeviceUs;
+  uint32_t lastSequence = lastEmittedSequence();
+  if (deviceState != STATE_STOPPED) stopAdc();
+  deviceState = STATE_STOPPED;
+  sendErrorFrame(requestId, errorCode, detail, token, lastSequence);
+}
+
+void sendStreamStopped(uint32_t requestId, uint8_t reason) {
+  uint64_t token = streamStartDeviceUs;
+  uint32_t count = deliveredOutputs;
+  stopAdc();
+  deviceState = STATE_STOPPED;
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU64(token);
+  writer.putU32(count);
+  writer.putU8(reason);
+  if (writer.ok()) sendFrame(MSG_STREAM_STOPPED, transmitPayload, writer.size());
+}
+
+bool validStreamConfig(const StreamConfig &config) {
+  if (config.format > FORMAT_VOLTS || config.mode > MODE_FINITE) return false;
+  if (config.profileId >= PROFILE_COUNT || config.gainIndex > 7 || config.autogain > 1) return false;
+  if (config.window == 0 || config.window > MAX_WINDOW) return false;
+  if (config.mode == MODE_CONTINUOUS && config.outputCount != 0) return false;
+  if (config.mode == MODE_FINITE && config.outputCount == 0) return false;
+  if (config.format == FORMAT_RAW && config.autogain != 0) return false;
+  return true;
+}
+
+bool beginStream(uint32_t requestId, const StreamConfig &config) {
+  if (!timeSynchronized) {
+    fail(requestId, ERR_TIME_NOT_SYNCED);
+    return false;
+  }
+  if (!adcReady) {
+    fail(requestId, ERR_ADC_CONFIG);
+    return false;
+  }
+  if (!configureTemperature() || !refreshTemperature()) {
+    fail(requestId, ERR_TEMPERATURE);
+    return false;
+  }
+  if (!configureAdc(config.profileId, config.gainIndex)) {
+    fail(requestId, ERR_ADC_CONFIG);
+    return false;
+  }
+
+  streamConfig = config;
+  resetWindow();
+  streamSequence = 0;
+  deliveredOutputs = 0;
+  streamStartDeviceUs = time_us_64();
+  streamStartUtcUs = synchronizedUtcUs + (streamStartDeviceUs - synchronizedMonotonicUs);
+  nextTemperatureUs = streamStartDeviceUs + TEMPERATURE_PERIOD_US;
+  deviceState = STATE_AWAITING_ACK;
+  streamAckDeadlineMs = millis() + STREAM_ACK_TIMEOUT_MS;
+
+  const Profile &profile = PROFILES[config.profileId];
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU64(streamStartDeviceUs);
+  writer.putU64(streamStartUtcUs);
+  writeStreamConfig(writer, config);
+  writer.putU32(profile.measuredMilliSps);
+  writer.putU8(static_cast<uint8_t>(config.gainIndex << 1));
+  writer.putU8(profile.register1);
+  writer.putU8(profile.register2);
+  writer.putU8(0x00);
+  writer.putU16(0);
+  writer.putU8(0xFF);
+  writer.putU16(13'107);
+  writer.putU16(27'853);
+  writer.putU16(0);
+  writer.putU8(activeDarkSource());
+  writer.putF32(activeDarkVolts());
+  writer.putU32(TEMPERATURE_PERIOD_US);
+  if (!writer.ok() || !sendFrame(MSG_STREAM_STARTED, transmitPayload, writer.size())) {
+    stopAdc();
+    deviceState = STATE_STOPPED;
+    return false;
+  }
+  return true;
+}
+
+void restartActiveStream(uint32_t requestId, const StreamConfig &config) {
+  if (deviceState != STATE_STOPPED) sendStreamStopped(0, STOP_REPLACED);
+  beginStream(requestId, config);
+}
+
+void sendHello(uint32_t requestId) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU8(FIRMWARE_MAJOR);
+  writer.putU8(FIRMWARE_MINOR);
+  writer.putU8(FIRMWARE_PATCH);
+  writer.putU8(HARDWARE_MAJOR);
+  writer.putU32(CAPABILITIES);
+  writer.putU16(MAX_DECODED_FRAME);
+  writer.putU64(deviceId);
+  writer.putU8(timeSynchronized ? 1 : 0);
+  writer.putU8(storageState);
+  if (writer.ok()) sendFrame(MSG_HELLO_REPLY, transmitPayload, writer.size());
+}
+
+void sendTimeSynced(uint32_t requestId, uint64_t utcUs, uint64_t monotonicUs) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU64(utcUs);
+  writer.putU64(monotonicUs);
+  if (writer.ok()) sendFrame(MSG_TIME_SYNCED, transmitPayload, writer.size());
+}
+
+void sendStatus(uint32_t requestId) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU8(deviceState);
+  writer.putU8(timeSynchronized ? 1 : 0);
+  writer.putU8(storageState);
+  writer.putU8(activeDarkSource());
+  writer.putF32(deviceDarkVolts);
+  writer.putF32(sessionDarkActive ? sessionDarkVolts : NAN);
+  writer.putF32(temperatureValid ? temperatureC : NAN);
+  writer.putU64(time_us_64());
+  writer.putU16(lastErrorCode);
+  if (writer.ok()) sendFrame(MSG_STATUS, transmitPayload, writer.size());
+}
+
+void sendProfiles(uint32_t requestId) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(requestId);
+  writer.putU8(PROFILE_COUNT);
+  for (const Profile &profile : PROFILES) {
+    size_t nameLength = strlen(profile.name);
+    writer.putU8(profile.id);
+    writer.putU8(static_cast<uint8_t>(nameLength));
+    writer.putText(profile.name);
+    writer.putU32(profile.measuredMilliSps);
+    writer.putU8(0x00);
+    writer.putU8(profile.register1);
+    writer.putU8(profile.register2);
+    writer.putU8(0x00);
+    writer.putU8(0xFF);
+    writer.putU16(0);
+  }
+  if (writer.ok()) sendFrame(MSG_PROFILES, transmitPayload, writer.size());
+}
+
+void sendSample(int32_t raw, uint64_t timestampUs, uint8_t gainIndex, uint8_t status) {
+  BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+  writer.putU32(streamSequence);
+  writer.putU64(timestampUs);
+  writer.putU8(gainIndex);
+  writer.putU8(status);
+  if (streamConfig.format == FORMAT_RAW) {
+    int32_t mean = static_cast<int32_t>(windowSum / streamConfig.window);
+    writer.putU32(static_cast<uint32_t>(mean));
+  } else {
+    double normalizedMean = static_cast<double>(windowSum) / streamConfig.window;
+    float volts = static_cast<float>(
+      normalizedMean * ADC_REFERENCE_V / (8'388'608.0 * 128.0)
+    ) - activeDarkVolts();
+    writer.putF32(volts);
+  }
+  writer.putF32(temperatureC);
+  uint8_t type = streamConfig.format == FORMAT_RAW ? MSG_SAMPLE_RAW : MSG_SAMPLE_VOLTS;
+  if (!writer.ok() || !sendFrame(type, transmitPayload, writer.size())) {
+    fail(0, ERR_OVERFLOW);
+    return;
+  }
+  streamSequence++;
+  deliveredOutputs++;
+  if (streamConfig.mode == MODE_FINITE && deliveredOutputs >= streamConfig.outputCount) {
+    sendStreamStopped(0, STOP_FINITE_COMPLETE);
+  }
+}
+
+void processConversion(int32_t raw, uint64_t timestampUs) {
+  uint8_t gainIndex = streamConfig.gainIndex;
+  uint8_t status = 0;
+  if (raw == ADC_POSITIVE_FULL_SCALE) status |= STATUS_ADC_POSITIVE_CLIP;
+  if (raw == ADC_NEGATIVE_FULL_SCALE) status |= STATUS_ADC_NEGATIVE_CLIP;
+  if (gainIndex == 0 && raw >= TIA_POSITIVE_CLIP_CODE_GAIN_1) {
+    status |= STATUS_TIA_POSITIVE_CLIP;
+  }
+
+  int32_t magnitude = raw < 0 ? -raw : raw;
+  uint8_t nextGain = gainIndex;
+  bool adcClipped = raw == ADC_POSITIVE_FULL_SCALE || raw == ADC_NEGATIVE_FULL_SCALE;
+  if (streamConfig.autogain) {
+    if (magnitude > AUTOGAIN_HIGH_CODE) {
+      if (gainIndex > 0) nextGain--;
+      else status |= STATUS_AUTOGAIN_OVERRANGE;
+    } else if (magnitude < AUTOGAIN_LOW_CODE) {
+      if (gainIndex < 7) nextGain++;
+      else status |= STATUS_AUTOGAIN_UNDERRANGE;
+    }
+  }
+
+  bool suppressClippedTransition = streamConfig.autogain && adcClipped && nextGain != gainIndex;
+  if (!suppressClippedTransition) {
+    int32_t value = raw;
+    if (streamConfig.format == FORMAT_VOLTS) value = raw * (1 << (7 - gainIndex));
+    addWindowValue(value);
+    if (windowReady()) sendSample(raw, timestampUs, gainIndex, status);
+  }
+  if (deviceState != STATE_STREAMING) return;
+
+  if (nextGain != gainIndex) {
+    streamConfig.gainIndex = nextGain;
+    if (!configureAdc(streamConfig.profileId, nextGain)) {
+      fail(0, ERR_ADC_CONFIG);
     }
   }
 }
 
-// Read 'count' samples (after autoexposing if enabled), average the raw
-// values, and emit one line: "raw,sensor_sat,adc_sat,gain".
-void sendReading(int count) {
-  if (autoGain) autoExpose();
-  if (count < 1) count = 1;
-  long sum = 0;
-  for (int i = 0; i < count; i++) {
-    sum += ads.readADC_SingleEnded(0);
-  }
-  int16_t raw = (int16_t)(sum / count);
-
-  Serial.print(raw);
-  Serial.print(",");
-  Serial.print(isSensorSat(raw) ? 1 : 0);
-  Serial.print(",");
-  Serial.print(isAdcSat(raw) ? 1 : 0);
-  Serial.print(",");
-  Serial.println(currentGain);
-}
-
-// After an 'r', read an optional decimal sample count terminated by a
-// non-digit (newline). Returns 1 if no digits are sent. A short timeout
-// guards against a missing terminator.
-int readCount() {
-  long n = 0;
-  bool anyDigit = false;
-  unsigned long t0 = millis();
-  while (millis() - t0 < 100) {
-    if (Serial.available() > 0) {
-      char c = Serial.read();
-      if (c >= '0' && c <= '9') {
-        n = n * 10 + (c - '0');
-        anyDigit = true;
-        t0 = millis();
-      } else {
-        break;  // terminator (newline/other)
-      }
+void processStreaming() {
+  uint32_t events;
+  uint64_t timestampUs;
+  if (takeDrdyEvents(events, timestampUs)) {
+    if (events != 1) {
+      fail(0, ERR_OVERFLOW, static_cast<uint16_t>(min(events, 65'535u)));
+      return;
     }
+    int32_t raw = adsReadRaw();
+    lastConversionActivityUs = timestampUs;
+    processConversion(raw, timestampUs);
+    if (deviceState != STATE_STREAMING) return;
   }
-  if (!anyDigit || n < 1) return 1;
-  if (n > 1000) n = 1000;  // sanity clamp
-  return (int)n;
+
+  uint64_t nowUs = time_us_64();
+  if (nowUs - lastConversionActivityUs > ADC_TIMEOUT_US) {
+    fail(0, ERR_ADC_TIMEOUT);
+    return;
+  }
+  if (nowUs >= nextTemperatureUs) {
+    if (!refreshTemperature()) {
+      fail(0, ERR_TEMPERATURE);
+      return;
+    }
+    nextTemperatureUs += TEMPERATURE_PERIOD_US;
+    if (nextTemperatureUs <= nowUs) nextTemperatureUs = nowUs + TEMPERATURE_PERIOD_US;
+  }
 }
 
-// Read a non-negative decimal integer terminated by a non-digit (newline).
-// Short timeout guards a missing terminator. Returns -1 if nothing read.
-long readLong() {
-  long n = -1;
-  unsigned long t0 = millis();
-  while (millis() - t0 < 1000) {
-    if (Serial.available() > 0) {
-      char c = Serial.read();
-      if (c >= '0' && c <= '9') {
-        if (n < 0) n = 0;
-        n = n * 10 + (c - '0');
-        t0 = millis();
-      } else {
+void processRequest(uint8_t messageType, const uint8_t *payload, size_t length, uint64_t receivedUs) {
+  BufferReader reader(payload, length);
+  uint32_t requestId = reader.getU32();
+  if (!reader.ok() || requestId == 0) {
+    fail(0, ERR_BAD_ARGUMENT);
+    return;
+  }
+
+  switch (messageType) {
+    case MSG_HELLO:
+      if (!reader.finished()) fail(requestId, ERR_BAD_SCHEMA);
+      else sendHello(requestId);
+      break;
+
+    case MSG_TIME_SYNC: {
+      uint64_t utcUs = reader.getU64();
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
         break;
       }
+      if (deviceState != STATE_STOPPED) sendStreamStopped(0, STOP_REPLACED);
+      synchronizedUtcUs = utcUs;
+      synchronizedMonotonicUs = receivedUs;
+      timeSynchronized = true;
+      sendTimeSynced(requestId, utcUs, receivedUs);
+      break;
+    }
+
+    case MSG_PING:
+      if (!reader.finished()) fail(requestId, ERR_BAD_SCHEMA);
+      else {
+        BufferWriter writer(transmitPayload, sizeof(transmitPayload));
+        writer.putU32(requestId);
+        sendFrame(MSG_PONG, transmitPayload, writer.size());
+      }
+      break;
+
+    case MSG_GET_STATUS:
+      if (!reader.finished()) fail(requestId, ERR_BAD_SCHEMA);
+      else sendStatus(requestId);
+      break;
+
+    case MSG_LIST_PROFILES:
+      if (!reader.finished()) fail(requestId, ERR_BAD_SCHEMA);
+      else sendProfiles(requestId);
+      break;
+
+    case MSG_START_STREAM: {
+      StreamConfig config = {};
+      config.format = reader.getU8();
+      config.mode = reader.getU8();
+      config.profileId = reader.getU8();
+      config.gainIndex = reader.getU8();
+      config.autogain = reader.getU8();
+      config.window = reader.getU16();
+      config.outputCount = reader.getU32();
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else if (!validStreamConfig(config)) {
+        fail(requestId, ERR_BAD_ARGUMENT);
+      } else {
+        restartActiveStream(requestId, config);
+      }
+      break;
+    }
+
+    case MSG_ACK_STREAM: {
+      uint64_t token = reader.getU64();
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else if (deviceState != STATE_AWAITING_ACK || token != streamStartDeviceUs) {
+        fail(requestId, ERR_BAD_STATE);
+      } else {
+        clearDrdyEvents();
+        adsCommand(ADS_CMD_START_SYNC);
+        lastConversionActivityUs = time_us_64();
+        if (!sendOk(requestId, MSG_ACK_STREAM)) {
+          fail(0, ERR_OVERFLOW);
+        } else {
+          deviceState = STATE_STREAMING;
+        }
+      }
+      break;
+    }
+
+    case MSG_STOP_STREAM:
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else if (deviceState == STATE_STOPPED) {
+        fail(requestId, ERR_BAD_STATE);
+      } else {
+        sendStreamStopped(requestId, STOP_REQUESTED);
+      }
+      break;
+
+    case MSG_SET_SESSION_DARK: {
+      float value = reader.getF32();
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else if (!std::isfinite(value) || fabsf(value) > DARK_LIMIT_V) {
+        fail(requestId, ERR_BAD_ARGUMENT);
+      } else {
+        bool restart = deviceState != STATE_STOPPED;
+        StreamConfig config = streamConfig;
+        sessionDarkVolts = value;
+        sessionDarkActive = true;
+        if (restart) restartActiveStream(requestId, config);
+        else sendOk(requestId, MSG_SET_SESSION_DARK);
+      }
+      break;
+    }
+
+    case MSG_CLEAR_SESSION_DARK: {
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else {
+        bool restart = deviceState != STATE_STOPPED;
+        StreamConfig config = streamConfig;
+        sessionDarkActive = false;
+        sessionDarkVolts = 0.0f;
+        if (restart) restartActiveStream(requestId, config);
+        else sendOk(requestId, MSG_CLEAR_SESSION_DARK);
+      }
+      break;
+    }
+
+    case MSG_SAVE_SESSION_DARK: {
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+        break;
+      }
+      if (!sessionDarkActive) {
+        fail(requestId, ERR_BAD_STATE);
+        break;
+      }
+      bool restart = deviceState != STATE_STOPPED;
+      StreamConfig config = streamConfig;
+      if (restart) sendStreamStopped(0, STOP_REPLACED);
+      float value = sessionDarkVolts;
+      if (!writeDarkFile(value)) {
+        fail(requestId, ERR_STORAGE_WRITE);
+      } else {
+        sessionDarkActive = false;
+        sessionDarkVolts = 0.0f;
+        if (restart) beginStream(requestId, config);
+        else sendOk(requestId, MSG_SAVE_SESSION_DARK);
+      }
+      break;
+    }
+
+    case MSG_RESET_STORAGE: {
+      uint64_t requestedDevice = reader.getU64();
+      bool confirmation = reader.matches("ERASE");
+      if (!reader.finished()) {
+        fail(requestId, ERR_BAD_SCHEMA);
+      } else if (requestedDevice != deviceId || !confirmation) {
+        fail(requestId, ERR_STORAGE_CONFIRMATION);
+      } else {
+        if (deviceState != STATE_STOPPED) sendStreamStopped(0, STOP_REPLACED);
+        if (!resetStorage()) fail(requestId, ERR_STORAGE_WRITE);
+        else sendOk(requestId, MSG_RESET_STORAGE);
+      }
+      break;
+    }
+
+    default:
+      fail(requestId, ERR_UNKNOWN_TYPE, messageType);
+      break;
+  }
+}
+
+void processEncodedFrame(uint64_t receivedUs) {
+  size_t decodedLength = cobsDecode(
+    receiveEncoded, receiveEncodedLength, receiveDecoded, sizeof(receiveDecoded)
+  );
+  if (decodedLength < 8) {
+    fail(0, ERR_BAD_FRAME);
+    return;
+  }
+  uint8_t version = receiveDecoded[0];
+  uint8_t messageType = receiveDecoded[1];
+  uint16_t payloadLength = static_cast<uint16_t>(receiveDecoded[2])
+    | static_cast<uint16_t>(receiveDecoded[3]) << 8;
+  if (version != PROTOCOL_VERSION) {
+    fail(0, ERR_BAD_VERSION, version);
+    return;
+  }
+  if (payloadLength > MAX_PAYLOAD || decodedLength != payloadLength + 8) {
+    fail(0, ERR_BAD_SCHEMA);
+    return;
+  }
+  uint32_t expectedCrc = static_cast<uint32_t>(receiveDecoded[decodedLength - 4])
+    | static_cast<uint32_t>(receiveDecoded[decodedLength - 3]) << 8
+    | static_cast<uint32_t>(receiveDecoded[decodedLength - 2]) << 16
+    | static_cast<uint32_t>(receiveDecoded[decodedLength - 1]) << 24;
+  if (crc32(receiveDecoded, decodedLength - 4) != expectedCrc) {
+    fail(0, ERR_BAD_CRC);
+    return;
+  }
+  processRequest(messageType, receiveDecoded + 4, payloadLength, receivedUs);
+}
+
+void pollSerial() {
+  while (Serial.available() > 0) {
+    uint8_t byte = static_cast<uint8_t>(Serial.read());
+    if (byte == 0) {
+      uint64_t receivedUs = time_us_64();
+      if (receiveOverflow) {
+        fail(0, ERR_BAD_FRAME);
+      } else if (receiveEncodedLength > 0) {
+        processEncodedFrame(receivedUs);
+      }
+      receiveEncodedLength = 0;
+      receiveOverflow = false;
+    } else if (!receiveOverflow) {
+      if (receiveEncodedLength < sizeof(receiveEncoded)) {
+        receiveEncoded[receiveEncodedLength++] = byte;
+      } else {
+        receiveOverflow = true;
+      }
     }
   }
-  return n;
 }
 
-// Receive N bytes from serial into the cal file. Host sends "W<N>\n" then N
-// raw bytes. Replies "ok <crc32>" on success or "err" on timeout/short read.
-void writeCalibration() {
-  long n = readLong();
-  if (n <= 0 || n > 65536) { sendErr(ERR_BAD_LEN); return; }
-  // Buffer the whole blob in RAM first. Writing to flash chunk-by-chunk while
-  // still receiving lets the USB-CDC RX buffer overflow (flash writes stall the
-  // read loop), dropping bytes — so receive fully, then write once.
-  uint8_t* data = (uint8_t*)malloc(n);
-  if (!data) { sendErr(ERR_NO_MEM); return; }
-  long got = 0;
-  unsigned long t0 = millis();
-  while (got < n && millis() - t0 < 5000) {
-    int r = Serial.readBytes(data + got, n - got);
-    if (r > 0) {
-      got += r;
-      t0 = millis();
-    }
-  }
-  if (got != n) { free(data); sendErr(ERR_TIMEOUT); return; }
-  File f = LittleFS.open(CAL_PATH, "w");
-  if (!f) { free(data); sendErr(ERR_FS_OPEN); return; }
-  size_t wrote = f.write(data, n);
-  f.close();
-  uint32_t crc = crc32_update(0xFFFFFFFF, data, n) ^ 0xFFFFFFFF;
-  free(data);
-  if ((long)wrote == n) {
-    Serial.print("ok ");
-    Serial.println(crc);
-  } else {
-    LittleFS.remove(CAL_PATH);
-    sendErr(ERR_WRITE);
+void captureDeviceIdentity() {
+  flash_get_unique_id(flashUniqueId);
+  deviceId = 0;
+  for (uint8_t byte : flashUniqueId) deviceId = (deviceId << 8) | byte;
+  for (size_t i = 0; i < sizeof(flashUniqueId); i++) {
+    snprintf(usbSerial + i * 2, sizeof(usbSerial) - i * 2, "%02X", flashUniqueId[i]);
   }
 }
 
-// Send the cal file: header line "<size> <crc32>\n" then <size> raw bytes.
-// Reports "0 0" if no calibration is stored.
-void readCalibration() {
-  File f = LittleFS.open(CAL_PATH, "r");
-  if (!f) { Serial.println("0 0"); return; }
-  size_t sz = f.size();
-  uint32_t crc = 0xFFFFFFFF;
-  uint8_t buf[256];
-  while (f.available()) {
-    int r = f.read(buf, sizeof(buf));
-    if (r > 0) crc = crc32_update(crc, buf, r);
-  }
-  Serial.print(sz);
-  Serial.print(" ");
-  Serial.println(crc ^ 0xFFFFFFFF);
-  f.seek(0);
-  while (f.available()) {
-    int r = f.read(buf, sizeof(buf));
-    if (r > 0) Serial.write(buf, r);
-  }
-  f.close();
+void configureUsbIdentity() {
+  USB.disconnect();
+  USB.setManufacturer("LightSensor");
+  USB.setProduct("LightSensor v3");
+  USB.setSerialNumber(usbSerial);
+  USB.connect();
 }
 
-// Identity line for the host handshake. Space-separated key=value pairs after a
-// fixed product token, e.g.:
-//   lightsensor proto=1 fw=1.0.0 id=AABBCCDDEEFF sps=860 vsat=3.20 gains=6.144,...
-// id is the 48-bit eFuse MAC (unique per chip), usable as a serial number.
-// The firmware is the source of truth for the gain table and saturation
-// voltage; it reports them here so the host driver can verify its mirror.
-void sendIdentity() {
-  uint64_t mac = ESP.getEfuseMac();
-  char id[13];
-  snprintf(id, sizeof(id), "%04X%08X",
-           (uint16_t)(mac >> 32), (uint32_t)mac);
-  int ngains = (int)(sizeof(gainVoltages) / sizeof(gainVoltages[0]));
-  Serial.print("lightsensor proto=");
-  Serial.print(PROTO_VERSION);
-  Serial.print(" fw=");
-  Serial.print(FW_VERSION);
-  Serial.print(" id=");
-  Serial.print(id);
-  Serial.print(" sps=860 vsat=");
-  Serial.print(SENSOR_SAT_V);
-  Serial.print(" dark=");
-  Serial.print(readDarkOffset(), 6);
-  Serial.print(" gains=");
-  for (int i = 0; i < ngains; i++) {
-    if (i) Serial.print(",");
-    Serial.print(gainVoltages[i], 3);
-  }
-  Serial.println();
+}  // namespace
+
+void setup() {
+  captureDeviceIdentity();
+  configureUsbIdentity();
+
+  pinMode(ADC_CS, OUTPUT);
+  digitalWrite(ADC_CS, HIGH);
+  pinMode(ADC_DRDY, INPUT);
+  SPI.setRX(ADC_MISO);
+  SPI.setCS(ADC_CS);
+  SPI.setSCK(ADC_SCK);
+  SPI.setTX(ADC_MOSI);
+  SPI.begin();
+  attachInterrupt(digitalPinToInterrupt(ADC_DRDY), onAdcDrdy, FALLING);
+  adcReady = initializeAdc();
+
+  Wire1.setSDA(TMP_SDA);
+  Wire1.setSCL(TMP_SCL);
+  Wire1.begin();
+  Wire1.setClock(400'000);
+  temperatureValid = configureTemperature() && refreshTemperature();
+
+  FSConfig filesystemConfig;
+  filesystemConfig.setAutoFormat(false);
+  LittleFS.setConfig(filesystemConfig);
+  filesystemMounted = LittleFS.begin();
+  loadPersistence();
+
+  Serial.begin(115200);
 }
 
 void loop() {
-  if (Serial.available() > 0) {
-    char cmd = Serial.read();
-
-    if (cmd == 'r') {
-      sendReading(readCount());
-
-    } else if (cmd == 'p') {
-      Serial.println("pong");  // CDC health check, no I2C
-
-    } else if (cmd == 'I') {
-      sendIdentity();  // product/proto/fw/id line for host handshake
-
-    } else if (cmd == 'D') {
-      Serial.println(readDarkOffset(), 9);
-
-    } else if (cmd == 'd') {
-      float offset;
-      if (!readDarkOffsetArgument(&offset)) {
-        sendErr(ERR_BAD_ARG);
-      } else if (writeDarkOffset(offset)) {
-        Serial.println("ok");
-      } else {
-        sendErr(ERR_WRITE);
-      }
-
-    } else if (cmd == 'g') {
-      while (!Serial.available());
-      char c = Serial.read();
-      int g = c - '0';
-      if (g >= 0 && g <= 5) {
-        currentGain = g;
-        ads.setGain(gains[currentGain]);
-        autoGain = false;  // manual gain turns autoexposure off
-        Serial.println("ok");
-      } else {
-        sendErr(ERR_BAD_ARG);
-      }
-
-    } else if (cmd == 'G') {
-      Serial.println(currentGain);
-
-    } else if (cmd == 'a') {
-      while (!Serial.available());
-      char c = Serial.read();  // a1 = enable, a0 = disable
-      if (c == '1') {
-        autoGain = true;
-        Serial.println("ok");
-      } else if (c == '0') {
-        autoGain = false;
-        Serial.println("ok");
-      } else {
-        sendErr(ERR_BAD_ARG);
-      }
-
-    } else if (cmd == 'A') {
-      Serial.print(autoGain ? 1 : 0);  // autogain status + current gain
-      Serial.print(" ");
-      Serial.println(currentGain);
-
-    } else if (cmd == 'W') {
-      writeCalibration();  // W<N>\n then N bytes -> "ok <crc>" / "err <code>"
-
-    } else if (cmd == 'C') {
-      readCalibration();   // -> "<size> <crc>\n" then <size> bytes
-
-    } else if (cmd == 'H') {
-      File f = LittleFS.open(CAL_PATH, "r");  // has-cal: size or 0
-      Serial.println(f ? (long)f.size() : 0);
-      if (f) f.close();
-
-    } else if (cmd == 'X') {
-      if (LittleFS.remove(CAL_PATH)) Serial.println("ok");
-      else sendErr(ERR_ERASE);  // erase cal
+  pollSerial();
+  if (deviceState == STATE_AWAITING_ACK) {
+    if (static_cast<int32_t>(millis() - streamAckDeadlineMs) >= 0) {
+      fail(0, ERR_ACK_TIMEOUT);
     }
+  } else if (deviceState == STATE_STREAMING) {
+    processStreaming();
   }
 }

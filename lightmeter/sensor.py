@@ -1,882 +1,838 @@
+from collections import deque
 from dataclasses import dataclass
+from enum import IntEnum, IntFlag
 import binascii
 import logging
 import math
+import struct
 import threading
-import serial
 import time
+
+import serial
 
 from lightmeter.port_detect import autodetect_port
 
 log = logging.getLogger(__name__)
 
-# Protocol version this driver speaks. Must match the device's reported `proto`;
-# a mismatch means the command set / response formats may have diverged.
-PROTO_VERSION = 2
+PROTO_VERSION = 3
+HARDWARE_MAJOR = 3
+BAUD_RATE = 115200
+MAX_DECODED_FRAME = 256
+MAX_ENCODED_FRAME = 258
+MAX_WINDOW = 1024
+MAX_DARK_OFFSET_V = 0.25
 
-# Device error codes returned as "err <code>". Keep in sync with firmware ERR_*.
-ERR_MESSAGES = {
-    1: "bad argument",
-    2: "bad length",
-    3: "out of memory",
-    4: "transfer timeout / short read",
-    5: "filesystem open failed",
-    6: "write size mismatch",
-    7: "erase failed",
+MSG_HELLO = 0x01
+MSG_TIME_SYNC = 0x02
+MSG_PING = 0x03
+MSG_GET_STATUS = 0x04
+MSG_LIST_PROFILES = 0x05
+MSG_START_STREAM = 0x10
+MSG_ACK_STREAM = 0x11
+MSG_STOP_STREAM = 0x12
+MSG_SET_SESSION_DARK = 0x20
+MSG_CLEAR_SESSION_DARK = 0x21
+MSG_SAVE_SESSION_DARK = 0x22
+MSG_RESET_STORAGE = 0x30
+
+MSG_HELLO_REPLY = 0x81
+MSG_TIME_SYNCED = 0x82
+MSG_PONG = 0x83
+MSG_STATUS = 0x84
+MSG_PROFILES = 0x85
+MSG_STREAM_STARTED = 0x90
+MSG_SAMPLE_RAW = 0x91
+MSG_SAMPLE_VOLTS = 0x92
+MSG_STREAM_STOPPED = 0x93
+MSG_OK = 0xA0
+MSG_ERROR = 0xFF
+
+ERROR_MESSAGES = {
+    1: "malformed or oversized frame",
+    2: "unsupported protocol version",
+    3: "message schema mismatch",
+    4: "CRC failure",
+    5: "unknown message type",
+    6: "invalid argument",
+    7: "invalid device state",
+    8: "time not synchronized",
+    9: "stream acknowledgement timeout",
+    10: "ADS1220 configuration failure",
+    11: "ADS1220 data-ready timeout",
+    12: "acquisition or USB overflow",
+    13: "TMP117 failure",
+    14: "LittleFS mount failure",
+    15: "persistent record integrity failure",
+    16: "persistent write failure",
+    17: "storage reset confirmation mismatch",
+    18: "firmware invariant failure",
 }
 
-
-def _err_text(resp):
-    """Human-readable text for an 'err [code]' response line."""
-    parts = resp.split()
-    if len(parts) >= 2 and parts[1].isdigit():
-        code = int(parts[1])
-        return f"err {code} ({ERR_MESSAGES.get(code, 'unknown')})"
-    return resp or "no response"
-
-# Gain index maps to: 0=±6.144V, 1=±4.096V, 2=±2.048V, 3=±1.024V, 4=±0.512V, 5=±0.256V
-GAIN_LABELS = ["±6.144V", "±4.096V", "±2.048V", "±1.024V", "±0.512V", "±0.256V"]
-GAIN_VOLTAGES = [6.144, 4.096, 2.048, 1.024, 0.512, 0.256]
-DEFAULT_GAIN = 1  # ±4.096V
-
-# OPA323 output saturates ~34 mV below the 3.3 V supply rail (measured).
-# In absolute scale (value * gain_voltage) this equals ~326.6.
-SATURATION_VOLTAGE = 3.2  # V
-
-# Electrical dark baseline from the schematic's R1/R3 divider:
-# 3.3 V × 270 Ω / (13 kΩ + 270 Ω). Firmware persists a per-device override.
-DEFAULT_DARK_OFFSET_V = 3.3 * 270 / (13_000 + 270)
-MAX_DARK_OFFSET_V = 0.25
-# Avoid flash wear when an averaged dark measurement has not materially changed.
-DARK_OFFSET_WRITE_TOLERANCE_V = 0.0001
+CAP_RAW_STREAM = 1 << 0
+CAP_VOLTS_STREAM = 1 << 1
+CAP_FINITE_STREAM = 1 << 2
+CAP_VOLTS_AUTOGAIN = 1 << 3
+CAP_TEMPERATURE = 1 << 4
+CAP_SESSION_DARK = 1 << 5
+CAP_PERSISTENT_DARK = 1 << 6
+CAP_STORAGE_RESET = 1 << 7
 
 
-def best_gain(max_voltage, headroom=0.85):
-    """Return the highest gain index that won't saturate for the given peak voltage.
-
-    Iterates from highest gain (±0.256 V) to lowest (±6.144 V) and returns
-    the first index where max_voltage fits below the saturation threshold
-    with the given headroom factor.
-    """
-    for g in range(len(GAIN_VOLTAGES) - 1, -1, -1):
-        threshold = min(SATURATION_VOLTAGE, GAIN_VOLTAGES[g]) * headroom
-        if max_voltage < threshold:
-            return g
-    return 0  # fall back to lowest gain (widest range)
+class StreamFormat(IntEnum):
+    RAW = 0
+    VOLTS = 1
 
 
-@dataclass
+class StreamMode(IntEnum):
+    CONTINUOUS = 0
+    FINITE = 1
+
+
+class DeviceState(IntEnum):
+    STOPPED = 0
+    AWAITING_ACK = 1
+    STREAMING = 2
+
+
+class StorageState(IntEnum):
+    EMPTY = 0
+    VALID = 1
+    FAULT = 2
+
+
+class StopReason(IntEnum):
+    REQUESTED = 0
+    FINITE_COMPLETE = 1
+    REPLACED = 2
+
+
+class SampleStatus(IntFlag):
+    NONE = 0
+    ADC_POSITIVE_CLIP = 1 << 0
+    ADC_NEGATIVE_CLIP = 1 << 1
+    TIA_POSITIVE_CLIP = 1 << 2
+    AUTOGAIN_OVERRANGE = 1 << 4
+    AUTOGAIN_UNDERRANGE = 1 << 5
+
+
+@dataclass(frozen=True)
 class DeviceInfo:
-    """Identity reported by the device's `I` command."""
-
-    product: str  # fixed product token, e.g. "lightsensor"
-    proto: int  # protocol version the device speaks
-    fw: str  # firmware version string
-    id: str  # unique device id (eFuse MAC hex) — usable as a serial number
-    fields: dict  # all parsed key=value pairs (sps, ngains, …)
-
-
-def parse_identity(line):
-    """Parse an identity line into a DeviceInfo, or None if it doesn't look like one.
-
-    Format: '<product> key=value key=value ...' e.g.
-    'lightsensor proto=2 fw=2.0.0 id=AABBCCDDEEFF sps=860 ngains=6'
-    """
-    parts = line.split()
-    if not parts or "=" in parts[0]:
-        return None
-    fields = {}
-    for tok in parts[1:]:
-        if "=" in tok:
-            k, v = tok.split("=", 1)
-            fields[k] = v
-    if "proto" not in fields:
-        return None
-    try:
-        proto = int(fields["proto"])
-    except ValueError:
-        return None
-    return DeviceInfo(parts[0], proto, fields.get("fw", "?"), fields.get("id", "?"), fields)
+    firmware_version: tuple[int, int, int]
+    hardware_major: int
+    capabilities: int
+    maximum_decoded_frame: int
+    device_id: str
+    time_synchronized: bool
+    storage_state: StorageState
 
 
-@dataclass
-class Calibration:
-    """Parsed calibration: metadata header + spectral responsivity curve."""
+@dataclass(frozen=True)
+class Profile:
+    id: int
+    name: str
+    measured_sps: float
+    registers: tuple[int, int, int, int]
+    allowed_gain_mask: int
+    settling_discard_count: int
 
-    metadata: dict  # header key/value pairs (device_id, cal_date, scale_factor, …)
-    wavelengths: list  # nm
-    responsivity: list  # one value per wavelength
-    raw_text: str  # the original CSV as stored on the device
 
-    @property
-    def scale_factor(self):
-        """Absolute scale (physical_unit per volt), or None if uncalibrated.
+@dataclass(frozen=True)
+class StreamConfig:
+    format: StreamFormat = StreamFormat.VOLTS
+    mode: StreamMode = StreamMode.CONTINUOUS
+    profile_id: int = 1
+    gain_index: int = 0
+    autogain: bool = True
+    window: int = 1
+    output_count: int = 0
 
-        Set by one reference measurement against a known source/meter. Until
-        that's taken it may be a placeholder (e.g. 1.0); a value of None or 1.0
-        means readings are not yet absolutely calibrated.
-        """
-        v = self.metadata.get("scale_factor")
-        return float(v) if v is not None else None
+    def __post_init__(self):
+        if not 0 <= self.profile_id <= 255:
+            raise ValueError("profile_id must fit in u8")
+        if not 0 <= self.gain_index <= 7:
+            raise ValueError("gain_index must be 0..7")
+        if not 1 <= self.window <= MAX_WINDOW:
+            raise ValueError(f"window must be 1..{MAX_WINDOW}")
+        if self.format is StreamFormat.RAW and self.autogain:
+            raise ValueError("raw streams cannot use autogain")
+        if self.mode is StreamMode.CONTINUOUS and self.output_count != 0:
+            raise ValueError("continuous streams require output_count=0")
+        if self.mode is StreamMode.FINITE and not 1 <= self.output_count <= 0xFFFFFFFF:
+            raise ValueError("finite streams require output_count=1..2^32-1")
 
     @property
-    def scale_units(self):
-        """Unit string the scale_factor maps to, e.g. 'W/m^2' (None if unset)."""
-        return self.metadata.get("scale_units")
+    def gain(self):
+        return 1 << self.gain_index
+
+
+@dataclass(frozen=True)
+class StreamHeader:
+    request_id: int
+    stream_start_device_us: int
+    stream_start_utc_us: int
+    config: StreamConfig
+    measured_sps: float
+    registers: tuple[int, int, int, int]
+    settling_discard_count: int
+    allowed_gain_mask: int
+    autogain_low_fraction: float
+    autogain_high_fraction: float
+    autogain_hysteresis_fraction: float
+    dark_source: int
+    active_dark_volts: float
+    temperature_period_us: int
+
+
+@dataclass(frozen=True)
+class RawSample:
+    sequence: int
+    device_timestamp_us: int
+    gain_index: int
+    status: SampleStatus
+    value: int
+    temperature_c: float
 
     @property
-    def provenance(self):
-        """Where this calibration came from: 'measured' (a real reference/
-        monochromator run) or 'datasheet-typical' (the bundled nominal fallback,
-        spectral shape only). Defaults to 'measured' when unspecified, since a
-        cal stored on the device is assumed real."""
-        return self.metadata.get("provenance", "measured")
+    def gain(self):
+        return 1 << self.gain_index
+
+
+@dataclass(frozen=True)
+class VoltageSample:
+    sequence: int
+    device_timestamp_us: int
+    gain_index: int
+    status: SampleStatus
+    value: float
+    temperature_c: float
 
     @property
-    def is_nominal(self):
-        """True for the datasheet-typical fallback — readings are order-of-
-        magnitude only and carry no part-specific absolute scale."""
-        return self.provenance == "datasheet-typical"
-
-    def responsivity_at(self, wl):
-        """Relative responsivity R(λ) at one wavelength by linear interpolation.
-
-        Returns 0.0 outside the measured band (the sensor has no calibrated
-        response there). Assumes wavelengths are ascending, as written by the
-        monochromator sweep.
-        """
-        wls, rs = self.wavelengths, self.responsivity
-        if not wls or wl < wls[0] or wl > wls[-1]:
-            return 0.0
-        # Binary search for the bracketing pair.
-        lo, hi = 0, len(wls) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if wls[mid] <= wl:
-                lo = mid
-            else:
-                hi = mid
-        span = wls[hi] - wls[lo]
-        if span == 0:
-            return rs[lo]
-        frac = (wl - wls[lo]) / span
-        return rs[lo] + frac * (rs[hi] - rs[lo])
-
-    def source_weighted_responsivity(self, source_wl, source_intensity):
-        """Source-weighted mean responsivity R̄ = ∫ s(λ)R(λ) dλ / ∫ s(λ) dλ.
-
-        s is the (relative) source spectrum sampled at `source_wl`; R is this
-        calibration's responsivity, interpolated onto the same wavelengths.
-        Trapezoidal integration over the source grid. This is the factor that
-        makes the same voltage mean different physical levels for different
-        source spectra. Returns None if the integral can't be formed.
-        """
-        if len(source_wl) != len(source_intensity) or len(source_wl) < 2:
-            return None
-        num = den = 0.0
-        for i in range(len(source_wl) - 1):
-            w0, w1 = source_wl[i], source_wl[i + 1]
-            dw = w1 - w0
-            if dw <= 0:
-                continue
-            s0, s1 = source_intensity[i], source_intensity[i + 1]
-            r0 = self.responsivity_at(w0)
-            r1 = self.responsivity_at(w1)
-            num += 0.5 * (s0 * r0 + s1 * r1) * dw
-            den += 0.5 * (s0 + s1) * dw
-        if den == 0:
-            return None
-        return num / den
-
-    def voltage_to_value(self, voltage, source=None):
-        """Convert a (dark-corrected) sensor voltage to a physical value.
-
-        Model: physical = scale_factor · V / R̄_source
-
-        source -- (wavelengths, intensities) of the light being measured, or
-            None. The sensor integrates the source over its spectral response,
-            so the same voltage means different physical levels for different
-            spectra; supplying the source applies that spectral correction.
-            With source=None, R̄_source defaults to 1.0 — i.e. you're measuring
-            the same spectrum the absolute scale was calibrated against.
-
-        Returns the value in `scale_units`, or None if no scale_factor is set
-        or the source spectrum doesn't overlap the calibrated band.
-        """
-        if self.scale_factor is None:
-            return None
-        r_bar = 1.0
-        if source is not None:
-            r_bar = self.source_weighted_responsivity(source[0], source[1])
-            if not r_bar:  # None or 0 — no usable overlap
-                return None
-        return self.scale_factor * voltage / r_bar
+    def gain(self):
+        return 1 << self.gain_index
 
 
-def parse_calibration(text):
-    """Parse calibration CSV text into a Calibration.
-
-    Header lines start with '#' as 'key: value'. The data section is a
-    'wavelength_nm,responsivity' table.
-    """
-    metadata = {}
-    wavelengths = []
-    responsivity = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            body = line[1:].strip()
-            if ":" in body:
-                key, val = body.split(":", 1)
-                metadata[key.strip()] = val.strip()
-            continue
-        if line.lower().startswith("wavelength"):
-            continue  # column header
-        parts = line.split(",")
-        if len(parts) >= 2:
-            try:
-                wavelengths.append(float(parts[0]))
-                responsivity.append(float(parts[1]))
-            except ValueError:
-                pass
-    return Calibration(metadata, wavelengths, responsivity, text)
+@dataclass(frozen=True)
+class StreamStopped:
+    request_id: int
+    stream_start_device_us: int
+    delivered_outputs: int
+    reason: StopReason
 
 
-_default_calibration_cache = None
+@dataclass(frozen=True)
+class ErrorEvent:
+    request_id: int
+    stream_start_device_us: int
+    last_sample_sequence: int | None
+    code: int
+    detail: int
+
+    @property
+    def message(self):
+        return ERROR_MESSAGES.get(self.code, f"unknown device error {self.code}")
 
 
-def default_calibration():
-    """The bundled BPW34 datasheet-typical calibration (spectral shape only).
-
-    A nominal fallback used when the device has no stored calibration: it carries
-    the real R(λ) shape from the Vishay BPW34 datasheet but no absolute
-    scale_factor (that needs the PCB transimpedance resistor and a reference
-    measurement). provenance == 'datasheet-typical'; see is_nominal. Cached after
-    first load. Returns None if the bundled file is missing.
-    """
-    global _default_calibration_cache
-    if _default_calibration_cache is None:
-        try:
-            from importlib.resources import files
-
-            text = (files("lightmeter") / "data" / "calibration_bpw34_typical.csv").read_text()
-            _default_calibration_cache = parse_calibration(text)
-        except (FileNotFoundError, ModuleNotFoundError, OSError):
-            return None
-    return _default_calibration_cache
+@dataclass(frozen=True)
+class DeviceStatus:
+    request_id: int
+    state: DeviceState
+    time_synchronized: bool
+    storage_state: StorageState
+    dark_source: int
+    device_dark_volts: float
+    session_dark_volts: float | None
+    temperature_c: float | None
+    device_monotonic_us: int
+    last_error_code: int
 
 
-def daylight_spectrum(temp_k=6500, lo_nm=380, hi_nm=1100, step_nm=5):
-    """A nominal daylight spectrum as (wavelengths_nm, relative_intensities).
-
-    A Planck blackbody at temp_k (default 6500 K ≈ CIE D65 correlated colour
-    temperature) sampled across the band. Only the *shape* matters for source
-    weighting (R̄ = ∫sR/∫s normalises out absolute scale), so this is returned
-    unnormalised. A blackbody is used rather than the tabulated D65 illuminant
-    because D65 stops at 830 nm, whereas this sensor (BPW34) responds out to
-    ~1100 nm — truncating there would drop the near-IR the silicon sees. This is
-    an approximation for an out-of-the-box estimate, not a metrological source.
-    """
-    c2 = 1.438776877e-2  # second radiation constant hc/k_B, m·K
-    wls, intensities = [], []
-    wl = lo_nm
-    while wl <= hi_nm:
-        lam = wl * 1e-9  # m
-        # Planck spectral radiance per wavelength, relative (constants dropped).
-        b = 1.0 / (lam**5 * (math.exp(c2 / (lam * temp_k)) - 1.0))
-        wls.append(wl)
-        intensities.append(b)
-        wl += step_nm
-    return wls, intensities
+class ProtocolError(RuntimeError):
+    pass
 
 
-# CIE 1924 photopic luminous efficiency V(λ), 380–780 nm at 10 nm steps
-# (peak 1.0 near 555 nm). Used to weight a spectrum for photometric units.
-LUMINOUS_EFFICACY_PEAK = 683.0  # lm/W at 555 nm (definition of the candela)
-PHOTOPIC_V = [
-    (380, 0.0000), (390, 0.0001), (400, 0.0004), (410, 0.0012), (420, 0.0040),
-    (430, 0.0116), (440, 0.0230), (450, 0.0380), (460, 0.0600), (470, 0.0910),
-    (480, 0.1390), (490, 0.2080), (500, 0.3230), (510, 0.5030), (520, 0.7100),
-    (530, 0.8620), (540, 0.9540), (550, 0.9950), (560, 0.9950), (570, 0.9520),
-    (580, 0.8700), (590, 0.7570), (600, 0.6310), (610, 0.5030), (620, 0.3810),
-    (630, 0.2650), (640, 0.1750), (650, 0.1070), (660, 0.0610), (670, 0.0320),
-    (680, 0.0170), (690, 0.0082), (700, 0.0041), (710, 0.0021), (720, 0.0010),
-    (730, 0.0005), (740, 0.0003), (750, 0.0001), (760, 0.0001), (770, 0.0000),
-    (780, 0.0000),
-]
-_photopic_cache = None
+class DeviceError(RuntimeError):
+    def __init__(self, event):
+        self.event = event
+        super().__init__(f"{event.message} (code={event.code}, detail={event.detail})")
 
 
-def _photopic_response():
-    """The photopic V(λ) curve wrapped as a Calibration so its trapezoidal
-    source-weighting can be reused. Cached."""
-    global _photopic_cache
-    if _photopic_cache is None:
-        wls = [w for w, _ in PHOTOPIC_V]
-        vs = [v for _, v in PHOTOPIC_V]
-        _photopic_cache = Calibration({}, wls, vs, "")
-    return _photopic_cache
+def _cobs_encode(data):
+    output = bytearray([0])
+    code_index = 0
+    code = 1
+    for byte in data:
+        if byte == 0:
+            output[code_index] = code
+            code_index = len(output)
+            output.append(0)
+            code = 1
+        else:
+            output.append(byte)
+            code += 1
+            if code == 0xFF:
+                output[code_index] = code
+                code_index = len(output)
+                output.append(0)
+                code = 1
+    output[code_index] = code
+    return bytes(output)
 
 
-def luminous_efficacy(source_wl, source_intensity):
-    """Luminous efficacy K of a source spectrum, in lm/W.
+def _cobs_decode(data):
+    output = bytearray()
+    index = 0
+    while index < len(data):
+        code = data[index]
+        if code == 0:
+            raise ProtocolError("zero byte inside COBS frame")
+        index += 1
+        end = index + code - 1
+        if end > len(data):
+            raise ProtocolError("truncated COBS frame")
+        output.extend(data[index:end])
+        index = end
+        if code != 0xFF and index < len(data):
+            output.append(0)
+    return bytes(output)
 
-    K = 683 · V̄, where V̄ is the source-weighted mean photopic efficiency
-    (∫ s V dλ / ∫ s dλ). Multiply a radiometric irradiance (W/m²) by K to get
-    illuminance (lux). Returns None if the weighting can't be formed.
-    """
-    v_bar = _photopic_response().source_weighted_responsivity(source_wl, source_intensity)
-    if v_bar is None:
-        return None
-    return LUMINOUS_EFFICACY_PEAK * v_bar
+
+def _encode_frame(message_type, payload):
+    if len(payload) > MAX_DECODED_FRAME - 8:
+        raise ValueError("payload exceeds protocol frame limit")
+    decoded = struct.pack("<BBH", PROTO_VERSION, message_type, len(payload)) + payload
+    decoded += struct.pack("<I", binascii.crc32(decoded) & 0xFFFFFFFF)
+    return _cobs_encode(decoded) + b"\0"
 
 
-@dataclass
-class Reading:
-    value: float  # light level, % of ADC full-scale (0–100)
-    sensor_sat: bool  # op-amp near supply rail (gain full-scale > VDD)
-    adc_sat: bool  # ADC raw hit 32767 (gain full-scale < VDD)
+def _decode_frame(encoded):
+    decoded = _cobs_decode(encoded)
+    if len(decoded) < 8:
+        raise ProtocolError("decoded frame is too short")
+    version, message_type, payload_length = struct.unpack_from("<BBH", decoded)
+    if version != PROTO_VERSION:
+        raise ProtocolError(f"device protocol {version}, driver protocol {PROTO_VERSION}")
+    if payload_length > MAX_DECODED_FRAME - 8 or len(decoded) != payload_length + 8:
+        raise ProtocolError("frame payload length mismatch")
+    expected_crc = struct.unpack_from("<I", decoded, len(decoded) - 4)[0]
+    actual_crc = binascii.crc32(decoded[:-4]) & 0xFFFFFFFF
+    if actual_crc != expected_crc:
+        raise ProtocolError("frame CRC mismatch")
+    return message_type, decoded[4:-4]
+
+
+class _PayloadReader:
+    def __init__(self, payload):
+        self.payload = payload
+        self.offset = 0
+
+    def unpack(self, format_):
+        size = struct.calcsize(format_)
+        if self.offset + size > len(self.payload):
+            raise ProtocolError("short message payload")
+        values = struct.unpack_from(format_, self.payload, self.offset)
+        self.offset += size
+        return values
+
+    def take(self, length):
+        if self.offset + length > len(self.payload):
+            raise ProtocolError("short message payload")
+        value = self.payload[self.offset : self.offset + length]
+        self.offset += length
+        return value
+
+    def finish(self):
+        if self.offset != len(self.payload):
+            raise ProtocolError("trailing message payload bytes")
 
 
 class LightSensor:
-    def __init__(self, port=None, baud=115200):
-        self.port = port or autodetect_port()
-        self.baud = baud
+    def __init__(self, port=None, *, timeout=2.0, auto_reconnect=False, device_id=None):
+        self.port = port
+        self._explicit_port = port is not None
+        self.timeout = timeout
+        self.auto_reconnect = auto_reconnect
+        self.requested_device_id = device_id.upper() if device_id else None
         self.ser = None
-        self.gain = DEFAULT_GAIN  # locally tracked; updated by set_gain()
-        # Autogain (autoexposure) is a firmware mode; this mirrors its state.
-        # When True, read() sends `r` and the device steps gain before
-        # replying with the settled gain.
-        self.autogain = False
-        # Device dark offset is persisted by firmware; a session zero may
-        # temporarily override it. Both are volts, so gain changes are safe.
-        self._device_dark_offset_v = DEFAULT_DARK_OFFSET_V
-        self._session_zero_offset_v = None
-        # Firmware-side averaging: each read() averages this many ADC samples
-        # on the device and returns one Reading.
-        self.average = 1
-        # Identity reported by the device at connect (None until handshake runs).
         self.info = None
-        # Cached calibration (loaded on demand via load_calibration()).
-        self.calibration = None
-        # Re-entrant lock guarding every serial transaction so the driver is
-        # safe to share across threads (e.g. the GUI sampler). Re-entrant
-        # because higher-level calls nest lower-level ones (zero() -> read()).
+        self.profiles = ()
+        self.stream_header = None
+        self._request_id = 0
+        self._rx = bytearray()
+        self._events = deque()
         self._lock = threading.RLock()
-        # Opt-in: when True, read() transparently reconnects on a link error
-        # instead of raising. Off by default so callers that manage their own
-        # reconnect (e.g. main.py) keep seeing the exception.
-        self.auto_reconnect = False
-        self.open()
-
-    def open(self):
-        """(Re)open the serial port.
-
-        The ESP32-C3 uses native USB CDC, which has no DTR/RTS auto-reset
-        circuit to work around, so a plain open is fine on both Linux and
-        Windows.
-        """
-        with self._lock:
-            self.close()
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
-            self._handshake()
 
     @property
     def connected(self):
-        """True if the serial port is currently open."""
-        return self.ser is not None and self.ser.is_open
+        return self.ser is not None and self.ser.is_open and self.info is not None
 
-    def reconnect(self, attempts=5, backoff=0.5):
-        """Re-establish the link after a disconnect (e.g. unplug/replug).
+    def _next_request_id(self):
+        self._request_id = (self._request_id + 1) & 0xFFFFFFFF
+        if self._request_id == 0:
+            self._request_id = 1
+        return self._request_id
 
-        Re-detects the port if the original path is gone (the device may
-        re-enumerate to a different name), reopens, and handshakes. Returns True
-        once connected, False if all attempts fail. Raises nothing.
-        """
-        with self._lock:
-            for i in range(attempts):
-                try:
-                    self.close()
-                    # The device can re-enumerate under a new path; re-detect if
-                    # the configured one isn't present, but keep an explicit port.
-                    try:
-                        self.port = autodetect_port()
-                    except Exception:
-                        pass  # fall back to the existing self.port
-                    self.ser = serial.Serial(self.port, self.baud, timeout=1)
-                    self._handshake()
-                    if self.connected:
-                        log.info("reconnected to %s", self.port)
-                        return True
-                except (serial.SerialException, OSError) as exc:
-                    log.warning("reconnect attempt %d/%d failed: %s", i + 1, attempts, exc)
-                time.sleep(backoff)
-            return False
-
-    def ping(self):
-        """Return True if the device answers `pong`. No I2C — pure link check."""
-        with self._lock:
-            if not self.connected:
-                return False
-            self.ser.write(b"p")
-            return self.ser.readline().decode(errors="ignore").strip() == "pong"
-
-    def _try_sync(self):
-        """Drain stale input and probe once with a ping. True if `pong` returns."""
-        self.ser.reset_input_buffer()
-        return self.ping()
-
-    def identify(self):
-        """Query device identity (`I`). Returns DeviceInfo or None on failure."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"I")
-            line = self.ser.readline().decode(errors="ignore").strip()
-        return parse_identity(line)
-
-    # Longest the device can block waiting for a command's payload (the `W`
-    # receive loop). Recovery must wait at least this long, in silence, for a
-    # stuck command to self-abort.
-    DEVICE_CMD_TIMEOUT = 5.0
-
-    def _handshake(self):
-        """Re-establish a clean command stream after (re)opening the port.
-
-        A killed script or interrupted transfer can leave the device mid-command
-        with unread bytes, desyncing the stream. If a quick ping doesn't get a
-        clean `pong`, the device is likely mid-transfer (e.g. a `W` awaiting its
-        payload) — so go SILENT for longer than its receive timeout, letting the
-        stuck command self-abort. Do not keep pinging: each byte we send feeds
-        the pending read and resets its timeout, so it would never recover.
-
-        After resync, read identity and check the protocol version. Best-effort:
-        logs warnings rather than raising so a device with older firmware
-        (no `I`/`p`) still connects. The `W` abort path discards only the partial
-        upload, never the stored calibration.
-        """
-        if not self._try_sync():
-            log.warning("no pong from %s; resyncing (waiting out device timeout)", self.port)
-            time.sleep(self.DEVICE_CMD_TIMEOUT + 0.5)
-            if not self._try_sync():
-                log.warning("%s still unresponsive after resync", self.port)
-        self.info = self.identify()
-        if self.info is None:
-            log.warning("device on %s did not report identity (old firmware?)", self.port)
-            return
-        if self.info.proto != PROTO_VERSION:
-            log.warning(
-                "protocol mismatch on %s: device proto=%d, driver expects %d",
-                self.port, self.info.proto, PROTO_VERSION,
-            )
-        self._verify_constants()
-        self._load_device_dark_offset()
-
-    def _load_device_dark_offset(self):
-        """Adopt the firmware-reported dark offset when it is valid.
-
-        Older firmware omits the optional identity field; retain the calculated
-        schematic default in that case.
-        """
-        value = self.info.fields.get("dark")
-        if value is None:
-            return
+    def _write_request(self, message_type, request_id, payload=b""):
+        frame = _encode_frame(message_type, struct.pack("<I", request_id) + payload)
         try:
-            offset = float(value)
-        except ValueError:
-            offset = None
-        if offset is None or not math.isfinite(offset) or abs(offset) > MAX_DARK_OFFSET_V:
-            log.warning("invalid device dark offset: %r", value)
-            return
-        self._device_dark_offset_v = offset
+            written = self.ser.write(frame)
+            self.ser.flush()
+        except serial.SerialException as exc:
+            self._link_failed(exc)
+        if written != len(frame):
+            raise ConnectionError(f"short serial write: {written}/{len(frame)} bytes")
 
-    def _verify_constants(self):
-        """Warn if the driver's mirrored constants drift from the device's.
+    def _link_failed(self, exc):
+        if self.auto_reconnect and self.reconnect():
+            raise ConnectionError("serial link failed; reconnected in stopped state") from exc
+        self.close()
+        raise ConnectionError("serial link failed") from exc
 
-        The firmware is the source of truth for the gain table and saturation
-        voltage and reports them in the identity line; this catches a driver/
-        firmware mismatch (e.g. after editing one but not the other) at connect.
-        """
-        fields = self.info.fields
-        if "gains" in fields:
-            try:
-                dev = [float(x) for x in fields["gains"].split(",")]
-            except ValueError:
-                dev = None
-            if dev and dev != GAIN_VOLTAGES:
-                log.warning("gain table mismatch: device=%s driver=%s", dev, GAIN_VOLTAGES)
-        if "vsat" in fields:
-            try:
-                if abs(float(fields["vsat"]) - SATURATION_VOLTAGE) > 0.01:
-                    log.warning(
-                        "saturation voltage mismatch: device=%s driver=%s",
-                        fields["vsat"], SATURATION_VOLTAGE,
-                    )
-            except ValueError:
-                pass
-
-    def _read_raw(self):
-        """One locked serial transaction: send 'r<n>' and parse the reply line.
-
-        Returns (raw, sensor_sat, adc_sat, gain) or None on a timeout /
-        malformed line. The 4th field (proto 2) is the gain the device used —
-        the settled gain when autogain is on. Raises serial.SerialException /
-        OSError if the link is gone. Logs parse failures.
-        """
-        n = self.average if self.average and self.average > 1 else 1
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(f"r{n}\n".encode())
-            line = self.ser.readline().decode(errors="ignore").strip()
-        if not line:
-            log.debug("read timeout (no line)")
-            return None
-        parts = line.split(",")
-        if len(parts) != 4:
-            log.debug("read parse error: %r", line)
-            return None
-        try:
-            return int(parts[0]), bool(int(parts[1])), bool(int(parts[2])), int(parts[3])
-        except ValueError:
-            log.debug("read parse error: %r", line)
-            return None
-
-    def read(self):
-        """Return a Reading(value, sensor_sat, adc_sat) or None on parse failure.
-
-        value      -- light level as % of ADC full-scale (0–100)
-        sensor_sat -- op-amp output near supply rail (low-gain settings)
-        adc_sat    -- ADC raw reading hit 32767 (high-gain settings)
-
-        Autoexposure lives in the firmware (see set_autogain); the device
-        reports the gain it used, which we record so reading_voltage converts
-        correctly. On a link error: if auto_reconnect is set, reconnects and
-        returns None; otherwise the exception propagates.
-        """
-        try:
-            raw_parts = self._read_raw()
-        except (serial.SerialException, OSError) as exc:
-            if not self.auto_reconnect:
-                raise
-            log.warning("read link error: %s — reconnecting", exc)
-            self.reconnect()
-            return None
-        if raw_parts is None:
-            return None
-        raw, sensor_sat, adc_sat, gain = raw_parts
-        self.gain = gain  # device is the source of truth (autogain may have stepped)
-        reading = Reading(raw / 32767 * 100, sensor_sat, adc_sat)
-        # Subtract the effective dark offset last (display only) so it never
-        # affects saturation flags. Use the gain the sample was actually taken at.
-        offset = self.effective_dark_offset_v
-        if offset:
-            reading.value -= offset / GAIN_VOLTAGES[gain] * 100
-        return reading
-
-    def reading_voltage(self, reading):
-        """Sensor voltage (V) for a Reading at the current gain, dark-corrected.
-
-        Reading.value is % of full-scale, which is gain-relative; this recovers
-        the absolute voltage the physical conversion needs.
-        """
-        return reading.value / 100 * GAIN_VOLTAGES[self.gain]
-
-    def read_physical(self, source=None):
-        """Read once and convert to a physical value via the cached calibration.
-
-        Loads calibration on first use (see load_calibration). Returns the value
-        in `calibration.scale_units`, or None if there's no reading, no
-        calibration/scale_factor, or the source spectrum doesn't overlap the
-        calibrated band. `source` is forwarded to Calibration.voltage_to_value.
-        """
-        if self.calibration is None:
-            self.load_calibration()
-        if self.calibration is None:
-            return None
-        reading = self.read()
-        if reading is None:
-            return None
-        return self.calibration.voltage_to_value(self.reading_voltage(reading), source)
-
-    def _measure_uncorrected_offset(self, n):
-        """Average n uncorrected samples in volts, or return None on failure."""
-        voltages = []
-        for _ in range(max(1, int(n))):
-            raw_parts = self._read_raw()
-            if raw_parts is None:
+    def _read_encoded(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            delimiter = self._rx.find(0)
+            if delimiter >= 0:
+                frame = bytes(self._rx[:delimiter])
+                del self._rx[: delimiter + 1]
+                if frame:
+                    return frame
                 continue
-            raw, _, _, gain = raw_parts
-            self.gain = gain
-            voltages.append(raw / 32767 * GAIN_VOLTAGES[gain])
-        return sum(voltages) / len(voltages) if voltages else None
+            if len(self._rx) > MAX_ENCODED_FRAME:
+                self._rx.clear()
+                raise ProtocolError("encoded frame exceeds protocol limit")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for protocol frame")
+            try:
+                self.ser.timeout = min(remaining, 0.05)
+                chunk = self.ser.read(max(self.ser.in_waiting, 1))
+            except serial.SerialException as exc:
+                self._link_failed(exc)
+            if chunk:
+                self._rx.extend(chunk)
 
-    @property
-    def device_dark_offset_v(self):
-        """Persisted per-device electrical dark correction in volts."""
-        return self._device_dark_offset_v
+    def _read_message(self, timeout=None):
+        encoded = self._read_encoded(self.timeout if timeout is None else timeout)
+        return _decode_frame(encoded)
 
-    @property
-    def session_zero_offset_v(self):
-        """Temporary session dark/background correction, or None if inactive."""
-        return self._session_zero_offset_v
-
-    @property
-    def effective_dark_offset_v(self):
-        """Active correction in volts: session zero overrides device calibration."""
-        return (
-            self._session_zero_offset_v
-            if self._session_zero_offset_v is not None
-            else self._device_dark_offset_v
+    def _parse_error(self, payload):
+        if len(payload) != 20:
+            raise ProtocolError("invalid ERROR payload length")
+        request_id, token, last_sequence, code, detail = struct.unpack("<IQIHH", payload)
+        return ErrorEvent(
+            request_id,
+            token,
+            None if last_sequence == 0xFFFFFFFF else last_sequence,
+            code,
+            detail,
         )
 
-    def set_device_dark_offset(self, offset_v):
-        """Persist a per-device electrical dark correction in volts.
+    def _parse_sample(self, message_type, payload):
+        if len(payload) != 22:
+            raise ProtocolError("invalid sample payload length")
+        sequence, timestamp, gain_index, status = struct.unpack_from("<IQBB", payload)
+        temperature = struct.unpack_from("<f", payload, 18)[0]
+        if message_type == MSG_SAMPLE_RAW:
+            value = struct.unpack_from("<i", payload, 14)[0]
+            return RawSample(sequence, timestamp, gain_index, SampleStatus(status), value, temperature)
+        value = struct.unpack_from("<f", payload, 14)[0]
+        return VoltageSample(sequence, timestamp, gain_index, SampleStatus(status), value, temperature)
 
-        Valid offsets are finite values within ±0.25 V. Returns True after a
-        firmware-acknowledged write, or without writing when the saved value is
-        already within 100 µV of the requested offset.
-        """
-        try:
-            offset = float(offset_v)
-        except (TypeError, ValueError):
-            return False
-        if not math.isfinite(offset) or abs(offset) > MAX_DARK_OFFSET_V:
-            return False
-        if abs(offset - self._device_dark_offset_v) <= DARK_OFFSET_WRITE_TOLERANCE_V:
-            return True
+    def _parse_stopped(self, payload):
+        if len(payload) != 17:
+            raise ProtocolError("invalid STREAM_STOPPED payload length")
+        request_id, token, count, reason = struct.unpack("<IQIB", payload)
+        return StreamStopped(request_id, token, count, StopReason(reason))
+
+    def _parse_header(self, payload):
+        reader = _PayloadReader(payload)
+        request_id, token, start_utc = reader.unpack("<IQQ")
+        format_, mode, profile_id, gain_index, autogain, window, count = reader.unpack(
+            "<BBBBBHI"
+        )
+        measured_millisps = reader.unpack("<I")[0]
+        registers = reader.unpack("<BBBB")
+        discard = reader.unpack("<H")[0]
+        gain_mask = reader.unpack("<B")[0]
+        low, high, hysteresis = reader.unpack("<HHH")
+        dark_source = reader.unpack("<B")[0]
+        dark_volts = reader.unpack("<f")[0]
+        temperature_period = reader.unpack("<I")[0]
+        reader.finish()
+        config = StreamConfig(
+            StreamFormat(format_),
+            StreamMode(mode),
+            profile_id,
+            gain_index,
+            bool(autogain),
+            window,
+            count,
+        )
+        return StreamHeader(
+            request_id,
+            token,
+            start_utc,
+            config,
+            measured_millisps / 1000.0,
+            registers,
+            discard,
+            gain_mask,
+            low / 32768.0,
+            high / 32768.0,
+            hysteresis / 32768.0,
+            dark_source,
+            dark_volts,
+            temperature_period,
+        )
+
+    def _parse_status(self, payload):
+        if len(payload) != 30:
+            raise ProtocolError("invalid STATUS payload length")
+        values = struct.unpack("<IBBBBfffQH", payload)
+        session_dark = None if math.isnan(values[6]) else values[6]
+        temperature = None if math.isnan(values[7]) else values[7]
+        return DeviceStatus(
+            values[0],
+            DeviceState(values[1]),
+            bool(values[2]),
+            StorageState(values[3]),
+            values[4],
+            values[5],
+            session_dark,
+            temperature,
+            values[8],
+            values[9],
+        )
+
+    def _event_from_message(self, message_type, payload):
+        if message_type in (MSG_SAMPLE_RAW, MSG_SAMPLE_VOLTS):
+            return self._parse_sample(message_type, payload)
+        if message_type == MSG_STREAM_STOPPED:
+            return self._parse_stopped(payload)
+        if message_type == MSG_ERROR:
+            return self._parse_error(payload)
+        raise ProtocolError(f"unexpected asynchronous message type 0x{message_type:02X}")
+
+    def _wait_for(self, request_id, accepted_types, timeout=None):
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for request {request_id}")
+            message_type, payload = self._read_message(remaining)
+            if message_type == MSG_ERROR:
+                event = self._parse_error(payload)
+                if event.request_id in (0, request_id):
+                    raise DeviceError(event)
+                self._events.append(event)
+                continue
+            if message_type in accepted_types:
+                response_id = struct.unpack_from("<I", payload)[0]
+                if response_id == request_id:
+                    return message_type, payload
+            self._events.append(self._event_from_message(message_type, payload))
+
+    def connect(self):
         with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(f"d{offset:.9g}\n".encode())
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        if resp != "ok":
-            log.warning("set_device_dark_offset(%s) failed: %s", offset, _err_text(resp))
-            return False
-        self._device_dark_offset_v = offset
+            if self.connected:
+                return self.info
+            port = self.port or autodetect_port(self.requested_device_id)
+            self.ser = serial.Serial(
+                port,
+                BAUD_RATE,
+                timeout=0.05,
+                write_timeout=self.timeout,
+            )
+            self.port = port
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+            self._rx.clear()
+            self._events.clear()
+            try:
+                request_id = self._next_request_id()
+                self._write_request(MSG_HELLO, request_id)
+                _, payload = self._wait_for(request_id, {MSG_HELLO_REPLY})
+                if len(payload) != 24:
+                    raise ProtocolError("invalid HELLO_REPLY payload length")
+                values = struct.unpack("<IBBBBIHQBB", payload)
+                info = DeviceInfo(
+                    (values[1], values[2], values[3]),
+                    values[4],
+                    values[5],
+                    values[6],
+                    f"{values[7]:016X}",
+                    bool(values[8]),
+                    StorageState(values[9]),
+                )
+                if info.hardware_major != HARDWARE_MAJOR:
+                    raise ProtocolError(f"unsupported hardware generation {info.hardware_major}")
+                if self.requested_device_id and info.device_id != self.requested_device_id:
+                    raise ProtocolError(
+                        f"connected device {info.device_id}, requested {self.requested_device_id}"
+                    )
+                self.requested_device_id = info.device_id
+                self.info = info
+                self.synchronize_time()
+                self.info = DeviceInfo(
+                    info.firmware_version,
+                    info.hardware_major,
+                    info.capabilities,
+                    info.maximum_decoded_frame,
+                    info.device_id,
+                    True,
+                    info.storage_state,
+                )
+                self.profiles = self.list_profiles()
+                return self.info
+            except Exception:
+                self.close()
+                raise
+
+    open = connect
+
+    def synchronize_time(self):
+        with self._lock:
+            request_id = self._next_request_id()
+            utc_us = time.time_ns() // 1000
+            self._write_request(MSG_TIME_SYNC, request_id, struct.pack("<Q", utc_us))
+            _, payload = self._wait_for(request_id, {MSG_TIME_SYNCED})
+            if len(payload) != 20:
+                raise ProtocolError("invalid TIME_SYNCED payload length")
+            response_id, echoed_utc, device_us = struct.unpack("<IQQ", payload)
+            if response_id != request_id or echoed_utc != utc_us:
+                raise ProtocolError("time synchronization reply mismatch")
+            return echoed_utc, device_us
+
+    def ping(self):
+        with self._lock:
+            request_id = self._next_request_id()
+            self._write_request(MSG_PING, request_id)
+            _, payload = self._wait_for(request_id, {MSG_PONG})
+            if payload != struct.pack("<I", request_id):
+                raise ProtocolError("invalid PONG payload")
+            return True
+
+    def list_profiles(self):
+        with self._lock:
+            request_id = self._next_request_id()
+            self._write_request(MSG_LIST_PROFILES, request_id)
+            _, payload = self._wait_for(request_id, {MSG_PROFILES})
+            reader = _PayloadReader(payload)
+            response_id = reader.unpack("<I")[0]
+            count = reader.unpack("<B")[0]
+            if response_id != request_id:
+                raise ProtocolError("profile reply request mismatch")
+            profiles = []
+            for _ in range(count):
+                profile_id, name_length = reader.unpack("<BB")
+                try:
+                    name = reader.take(name_length).decode("ascii")
+                except UnicodeDecodeError as exc:
+                    raise ProtocolError("profile name is not ASCII") from exc
+                measured_millisps = reader.unpack("<I")[0]
+                registers = reader.unpack("<BBBB")
+                gain_mask = reader.unpack("<B")[0]
+                discard = reader.unpack("<H")[0]
+                profiles.append(
+                    Profile(
+                        profile_id,
+                        name,
+                        measured_millisps / 1000.0,
+                        registers,
+                        gain_mask,
+                        discard,
+                    )
+                )
+            reader.finish()
+            return tuple(profiles)
+
+    def get_status(self):
+        with self._lock:
+            request_id = self._next_request_id()
+            self._write_request(MSG_GET_STATUS, request_id)
+            _, payload = self._wait_for(request_id, {MSG_STATUS})
+            status = self._parse_status(payload)
+            if status.request_id != request_id:
+                raise ProtocolError("status reply request mismatch")
+            return status
+
+    def _ack_header(self, header):
+        request_id = self._next_request_id()
+        self._write_request(
+            MSG_ACK_STREAM,
+            request_id,
+            struct.pack("<Q", header.stream_start_device_us),
+        )
+        _, payload = self._wait_for(request_id, {MSG_OK})
+        if payload != struct.pack("<IB", request_id, MSG_ACK_STREAM):
+            raise ProtocolError("invalid ACK_STREAM reply")
+        self.stream_header = header
+        return header
+
+    def start_stream(self, config):
+        with self._lock:
+            if not isinstance(config, StreamConfig):
+                raise TypeError("config must be StreamConfig")
+            request_id = self._next_request_id()
+            payload = struct.pack(
+                "<BBBBBHI",
+                config.format,
+                config.mode,
+                config.profile_id,
+                config.gain_index,
+                config.autogain,
+                config.window,
+                config.output_count,
+            )
+            self._write_request(MSG_START_STREAM, request_id, payload)
+            _, response = self._wait_for(request_id, {MSG_STREAM_STARTED})
+            header = self._parse_header(response)
+            self._events.clear()
+            return self._ack_header(header)
+
+    def stop_stream(self):
+        with self._lock:
+            request_id = self._next_request_id()
+            self._write_request(MSG_STOP_STREAM, request_id)
+            _, payload = self._wait_for(request_id, {MSG_STREAM_STOPPED})
+            event = self._parse_stopped(payload)
+            self.stream_header = None
+            self._events.clear()
+            self._rx.clear()
+            self.ser.reset_input_buffer()
+            return event
+
+    def read_event(self, timeout=None):
+        with self._lock:
+            if self._events:
+                event = self._events.popleft()
+            else:
+                message_type, payload = self._read_message(timeout)
+                event = self._event_from_message(message_type, payload)
+            if isinstance(event, ErrorEvent) or (
+                isinstance(event, StreamStopped)
+                and self.stream_header is not None
+                and event.stream_start_device_us == self.stream_header.stream_start_device_us
+            ):
+                self.stream_header = None
+            return event
+
+    def _dark_command(self, message_type, payload=b""):
+        request_id = self._next_request_id()
+        self._write_request(message_type, request_id, payload)
+        response_type, response = self._wait_for(request_id, {MSG_OK, MSG_STREAM_STARTED})
+        if response_type == MSG_OK:
+            if response != struct.pack("<IB", request_id, message_type):
+                raise ProtocolError("invalid dark command reply")
+            return None
+        header = self._parse_header(response)
+        self._events.clear()
+        return self._ack_header(header)
+    def _set_storage_state(self, state):
         if self.info is not None:
-            self.info.fields["dark"] = f"{offset:.9g}"
-        return True
+            self.info = DeviceInfo(
+                self.info.firmware_version,
+                self.info.hardware_major,
+                self.info.capabilities,
+                self.info.maximum_decoded_frame,
+                self.info.device_id,
+                self.info.time_synchronized,
+                state,
+            )
 
-    def reset_device_dark_offset(self):
-        """Restore the calculated R1/R3 divider baseline on the device."""
-        return self.set_device_dark_offset(DEFAULT_DARK_OFFSET_V)
 
-    def calibrate_device_dark_offset(self, n=200):
-        """Measure covered-sensor dark voltage and persist it on the device.
-
-        Autogain and session zeroing are suspended while sampling the true
-        electrical level. Returns the persisted volts, or None on failure.
-        """
-        was_autogain = self.autogain
-        previous_session = self._session_zero_offset_v
-        if was_autogain:
-            self.set_autogain(False)
-        try:
-            self._session_zero_offset_v = None
-            offset = self._measure_uncorrected_offset(n)
-        finally:
-            self._session_zero_offset_v = previous_session
-            if was_autogain:
-                self.set_autogain(True)
-        return offset if offset is not None and self.set_device_dark_offset(offset) else None
-
-    def save_session_dark_offset(self):
-        """Persist the existing session dark/background correction.
-
-        Returns False when no session zero has been measured. The value is
-        otherwise passed unchanged to set_device_dark_offset(), including its
-        flash-write guard.
-        """
-        if self._session_zero_offset_v is None:
-            return False
-        return self.set_device_dark_offset(self._session_zero_offset_v)
-
-    def zero(self, n=50):
-        """Temporarily zero the current dark/background level over n samples.
-
-        A session zero overrides, but never overwrites, the persisted device
-        dark correction. Returns the effective offset in volts.
-        """
-        was_autogain = self.autogain
-        previous_session = self._session_zero_offset_v
-        if was_autogain:
-            self.set_autogain(False)
-        try:
-            self._session_zero_offset_v = None
-            offset = self._measure_uncorrected_offset(n)
-            self._session_zero_offset_v = offset if offset is not None else previous_session
-        finally:
-            if was_autogain:
-                self.set_autogain(True)
-        return self.effective_dark_offset_v
+    def set_session_dark(self, volts):
+        with self._lock:
+            if not math.isfinite(volts) or abs(volts) > MAX_DARK_OFFSET_V:
+                raise ValueError(f"dark correction must be within ±{MAX_DARK_OFFSET_V} V")
+            return self._dark_command(MSG_SET_SESSION_DARK, struct.pack("<f", volts))
 
     def clear_zero(self):
-        """Clear the session zero and resume the persisted device correction."""
-        self._session_zero_offset_v = None
-
-    @property
-    def is_zeroed(self):
-        """True when either a session or persisted dark correction is active."""
-        return self.effective_dark_offset_v != 0.0
-
-    @property
-    def zero_offset(self):
-        """Current effective dark correction in volts."""
-        return self.effective_dark_offset_v
-
-    def set_autogain(self, enabled):
-        """Enable/disable firmware autoexposure (a1/a0). read() then reports
-        the settled gain. Returns True on device ack."""
         with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"a1" if enabled else b"a0")
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        if resp == "ok":
-            self.autogain = enabled
+            return self._dark_command(MSG_CLEAR_SESSION_DARK)
+
+    def save_baseline(self):
+        with self._lock:
+            header = self._dark_command(MSG_SAVE_SESSION_DARK)
+            self._set_storage_state(StorageState.VALID)
+            return header
+
+    def zero(self, sample_count, *, profile_id=0, gain_index=7):
+        with self._lock:
+            if not 1 <= sample_count <= 0xFFFFFFFF:
+                raise ValueError("sample_count must be 1..2^32-1")
+            status = self.get_status()
+            if status.state is not DeviceState.STOPPED:
+                self.stop_stream()
+            self.set_session_dark(0.0)
+            config = StreamConfig(
+                format=StreamFormat.VOLTS,
+                mode=StreamMode.FINITE,
+                profile_id=profile_id,
+                gain_index=gain_index,
+                autogain=False,
+                window=1,
+                output_count=sample_count,
+            )
+            self.start_stream(config)
+            values = []
+            while True:
+                event = self.read_event(max(self.timeout, sample_count / 10.0))
+                if isinstance(event, VoltageSample):
+                    values.append(event.value)
+                elif isinstance(event, ErrorEvent):
+                    raise DeviceError(event)
+                elif isinstance(event, StreamStopped):
+                    break
+            if len(values) != sample_count:
+                raise ProtocolError(f"zero acquired {len(values)}/{sample_count} samples")
+            baseline = math.fsum(values) / len(values)
+            self.set_session_dark(baseline)
+            return baseline
+
+    def reset_storage(self, confirm_device_id):
+        with self._lock:
+            if self.info is None:
+                raise RuntimeError("sensor is not connected")
+            normalized = confirm_device_id.upper()
+            if normalized != self.info.device_id:
+                raise ValueError(f"confirmation must equal device ID {self.info.device_id}")
+            request_id = self._next_request_id()
+            payload = struct.pack("<Q", int(normalized, 16)) + b"ERASE"
+            self._write_request(MSG_RESET_STORAGE, request_id, payload)
+            _, response = self._wait_for(request_id, {MSG_OK})
+            if response != struct.pack("<IB", request_id, MSG_RESET_STORAGE):
+                raise ProtocolError("invalid RESET_STORAGE reply")
+            self._set_storage_state(StorageState.EMPTY)
             return True
-        log.warning("set_autogain(%s) failed: %s", enabled, _err_text(resp))
-        return False
 
-    def get_autogain(self):
-        """Query device autogain state and current gain (A). Returns
-        (enabled, gain) or None on failure."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"A")
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        parts = resp.split()
-        if len(parts) == 2 and parts[0] in ("0", "1") and parts[1].isdigit():
-            return parts[0] == "1", int(parts[1])
-        return None
-
-    def set_gain(self, gain_index):
-        """Set ADC gain. gain_index 0–5 maps to ±6.144V … ±0.256V. Returns True on success."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(f"g{gain_index}".encode())
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        if resp == "ok":
-            self.gain = gain_index
-            self.autogain = False  # manual gain turns firmware autoexposure off
-            return True
-        log.warning("set_gain(%s) failed: %s", gain_index, _err_text(resp))
-        return False
-
-    def get_gain(self):
-        """Return current gain index (0–5), or None on failure."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"G")
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        return int(resp) if resp.isdigit() else None
-
-    # --- Calibration storage (on-device LittleFS) ---------------------------
-
-    def has_calibration(self):
-        """Return the stored calibration size in bytes (0 if none)."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"H")
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        return int(resp) if resp.isdigit() else 0
-
-    def write_calibration(self, text):
-        """Store calibration CSV text on the device. Returns True if the
-        device-computed CRC32 matches the host's (transfer verified)."""
-        data = text.encode() if isinstance(text, str) else text
-        expected = binascii.crc32(data) & 0xFFFFFFFF
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(f"W{len(data)}\n".encode())
-            self.ser.flush()
-            # Throttle the payload: a single fast burst overruns the device's
-            # USB-CDC RX buffer (it can't drain while writing flash), dropping
-            # bytes. Small flushed chunks with a brief pause keep it reliable.
-            for i in range(0, len(data), 128):
-                self.ser.write(data[i : i + 128])
-                self.ser.flush()
-                time.sleep(0.002)
-            resp = self.ser.readline().decode(errors="ignore").strip()
-        parts = resp.split()
-        if len(parts) == 2 and parts[0] == "ok":
-            ok = int(parts[1]) == expected
-            if not ok:
-                log.warning("write_calibration CRC mismatch: device=%s host=%s", parts[1], expected)
-            elif self.calibration is not None:
-                self.calibration = None  # invalidate cache; reloaded on next use
-            return ok
-        log.warning("write_calibration failed: %s", _err_text(resp))
-        return False
-
-    def write_calibration_file(self, path):
-        """Store a calibration CSV file from disk. Returns True on verified write."""
-        with open(path, "r") as f:
-            return self.write_calibration(f.read())
-
-    def read_calibration(self):
-        """Read the stored calibration. Returns a Calibration, or None if the
-        device has no calibration or the CRC32 check fails."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"C")
-            header = self.ser.readline().decode(errors="ignore").strip()
-            parts = header.split()
-            if len(parts) != 2:
-                return None
-            size, crc = int(parts[0]), int(parts[1])
-            if size == 0:
-                return None
-            data = self.ser.read(size)  # blocks up to the serial timeout
-        if len(data) != size or (binascii.crc32(data) & 0xFFFFFFFF) != crc:
-            return None
-        return parse_calibration(data.decode(errors="ignore"))
-
-    def load_calibration(self, use_default=True):
-        """Read the device calibration and cache it in self.calibration.
-
-        Returns the Calibration. read_physical() calls this on first use; call it
-        explicitly to refresh after a write. When the device has no stored cal and
-        use_default is True, falls back to the bundled BPW34 datasheet-typical
-        calibration (provenance 'datasheet-typical', see Calibration.is_nominal) so
-        readings have a real spectral shape out of the box — note it has no absolute
-        scale_factor, so read_physical() still returns None until one is set. Pass
-        use_default=False to get None when the device is uncalibrated.
-        """
-        cal = self.read_calibration()
-        if cal is None and use_default:
-            cal = default_calibration()
-        self.calibration = cal
-        return self.calibration
-
-    def clear_calibration(self):
-        """Erase the stored calibration. Returns True on success."""
-        with self._lock:
-            if not self.connected:
-                self.open()
-            self.ser.write(b"X")
-            ok = self.ser.readline().decode(errors="ignore").strip() == "ok"
-        if ok:
-            self.calibration = None  # invalidate cache
-        return ok
+    def reconnect(self):
+        port = self.port if self._explicit_port else None
+        self.close()
+        self.port = port
+        try:
+            self.connect()
+        except (ConnectionError, OSError, ProtocolError, serial.SerialException):
+            log.warning("LightSensor reconnect failed", exc_info=True)
+            return False
+        return True
 
     def close(self):
         with self._lock:
-            if self.ser is not None and self.ser.is_open:
-                self.ser.close()
-            self.ser = None
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                finally:
+                    self.ser = None
+            self.info = None
+            self.profiles = ()
+            self.stream_header = None
+            self._rx.clear()
+            self._events.clear()
 
     def __enter__(self):
+        self.connect()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc, traceback):
         self.close()

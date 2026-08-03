@@ -1,62 +1,53 @@
-"""Serial port auto-detection for the LightSensor device (ESP32-C3 SuperMini).
-
-Works on Linux and Windows. Importable (`autodetect_port()`) and runnable as a
-script that prints the detected port — used by the justfile when flashing:
-
-    arduino-cli upload -p "$(uv run python port_detect.py)" ...
-"""
+"""USB serial discovery for the LightSensor v3 RP2040 board."""
 
 import sys
 
 import serial.tools.list_ports
 
-# The ESP32-C3 SuperMini exposes the chip's native USB Serial/JTAG.
-# (VID, PID) pairs for known devices.
-_KNOWN_HWIDS = (
-    (0x303A, 0x1001),  # Espressif native USB (ESP32-C3 / S3 USB Serial/JTAG)
-)
-# Fallback substring hints matched against the port description / hardware id.
-_DESCRIPTION_HINTS = ("espressif", "esp32", "usb jtag", "usb serial/jtag")
+USB_VID_PID = (0x2E8A, 0xF00A)
+USB_PRODUCT = "lightsensor v3"
 
 
-def autodetect_port():
-    """Return the serial port the sensor is most likely connected to.
+def _is_lightsensor(port):
+    product = (port.product or "").strip().lower()
+    manufacturer = (port.manufacturer or "").strip().lower()
+    description = (port.description or "").lower()
+    return product == USB_PRODUCT or (
+        (port.vid, port.pid) == USB_VID_PID
+        and (manufacturer == "lightsensor" or USB_PRODUCT in description)
+    )
 
-    Resolution order:
-      1. USB VID/PID match against known devices.
-      2. Description / hardware-id substring match.
-      3. If exactly one serial port exists, use it.
-    Raises RuntimeError if no suitable port can be determined.
+
+def autodetect_port(device_id=None):
+    """Return a unique LightSensor v3 CDC port.
+
+    ``device_id`` optionally selects the uppercase W25Q32 UID exposed as the USB
+    serial number. Protocol identity is still verified by :class:`LightSensor`.
     """
+    requested = device_id.upper() if device_id else None
     ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        raise RuntimeError("No serial ports found. Is the device plugged in?")
-
-    # 1) Match by USB VID/PID.
-    for p in ports:
-        if p.vid is not None and (p.vid, p.pid) in _KNOWN_HWIDS:
-            return p.device
-
-    # 2) Match by description / hardware-id text.
-    for p in ports:
-        text = f"{p.description} {p.hwid}".lower()
-        if any(hint in text for hint in _DESCRIPTION_HINTS):
-            return p.device
-
-    # 3) Fall back to the only available port.
-    if len(ports) == 1:
-        return ports[0].device
-
-    available = ", ".join(f"{p.device} ({p.description})" for p in ports)
+    candidates = [port for port in ports if _is_lightsensor(port)]
+    if requested:
+        candidates = [
+            port for port in candidates if (port.serial_number or "").upper() == requested
+        ]
+    if len(candidates) == 1:
+        return candidates[0].device
+    if not candidates:
+        target = f" with device ID {requested}" if requested else ""
+        raise RuntimeError(f"No LightSensor v3 USB device found{target}.")
+    available = ", ".join(
+        f"{port.device} ({port.serial_number or 'no serial'})" for port in candidates
+    )
     raise RuntimeError(
-        "Could not auto-detect the device port. Specify one explicitly. "
-        f"Available ports: {available}"
+        "Multiple LightSensor v3 devices found; specify a port or device ID. "
+        f"Candidates: {available}"
     )
 
 
 if __name__ == "__main__":
     try:
-        print(autodetect_port())
+        print(autodetect_port(sys.argv[1] if len(sys.argv) > 1 else None))
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)

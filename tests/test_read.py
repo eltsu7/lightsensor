@@ -1,28 +1,31 @@
-"""Quick smoke test: auto-connect, read N samples, print them with timing."""
+"""Connected LightSensor v3 smoke test. Run directly; do not test-discover."""
 
-import time
-from lightmeter.sensor import LightSensor, GAIN_LABELS
+from lightmeter import (
+    ErrorEvent,
+    LightSensor,
+    StreamConfig,
+    StreamMode,
+    StreamStopped,
+    VoltageSample,
+)
 
-N = 10
 
-with LightSensor() as sensor:
-    print(f"Connected. gain={sensor.gain} ({GAIN_LABELS[sensor.gain]})")
-    t0 = time.perf_counter()
-    last = t0
-    count = 0
-    for i in range(N):
-        r = sensor.read()
-        now = time.perf_counter()
-        dt = (now - last) * 1000
-        last = now
-        if r is None:
-            print(f"[{i}] read failed (None)")
-            continue
-        count += 1
-        print(
-            f"[{i}] value={r.value:6.2f}%  sensor_sat={r.sensor_sat}  "
-            f"adc_sat={r.adc_sat}  dt={dt:6.1f} ms"
-        )
-    total = time.perf_counter() - t0
-    if count:
-        print(f"\n{count}/{N} ok in {total * 1000:.0f} ms  -> {count / total:.1f} samples/s")
+with LightSensor(timeout=3.0) as sensor:
+    print(sensor.info)
+    for profile in sensor.profiles:
+        print(profile)
+    sensor.start_stream(StreamConfig(mode=StreamMode.FINITE, output_count=10))
+    samples = []
+    while True:
+        event = sensor.read_event(5.0)
+        if isinstance(event, VoltageSample):
+            samples.append(event)
+            print(event)
+        elif isinstance(event, ErrorEvent):
+            raise RuntimeError(event)
+        elif isinstance(event, StreamStopped):
+            assert event.delivered_outputs == 10
+            break
+
+assert len(samples) == 10
+assert [sample.sequence for sample in samples] == list(range(10))

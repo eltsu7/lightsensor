@@ -1,141 +1,137 @@
 # lightmeter
 
-A calibrated light sensor: custom PCB (OPA323 transimpedance amplifier + ADS1115
-16-bit ADC, I2C) read by an ESP32-C3 SuperMini over native USB. Firmware streams
-raw counts and can autoexpose; a Python driver + Tkinter GUI and a Rust driver
-both speak the same serial protocol.
+LightSensor v3 is a USB light-measurement instrument built around a BPW34
+photodiode, OPA323 transimpedance amplifier, ADS1220 24-bit ADC, TMP117 board
+temperature sensor, and bare RP2040. The RP2040 streams raw ADC codes or
+canonical differential volts over native USB CDC. A Python driver and Tkinter
+GUI provide control, plotting, dark zeroing, and CSV recording.
 
-> **Work in progress.** The absolute calibration numbers are placeholders
-> pending a reference measurement — see [Calibration status](#calibration-status)
-> and [`TODO.md`](TODO.md).
+The ordered-board electrical contract and measured bring-up results are in
+[`docs/v3/hardware.md`](docs/v3/hardware.md). Absolute optical calibration and
+temperature compensation are not implemented yet.
 
 ## Features
 
-- **Firmware-side autogain** — when enabled, the device autoexposes itself
-  (steps gain, re-reads, until in-band) before every averaged read; the host never guesses.
-- **Gain-independent data.** Readings convert to volts, not raw counts or
-  gain-relative percentages, so a session survives gain changes intact.
-- **Device dark correction + session zeroing.** Firmware persists a per-device
-  electrical baseline (default: the calculated 67.144 mV R1/R3 divider value);
-  after **Zero background** measures a covered sensor into the session offset,
-  the GUI can save that exact session value as the device correction, avoiding a
-  flash write when it is within 100 µV of the saved value. Saturation flags
-  (op-amp rail vs. ADC overflow) remain firmware-reported and mutually exclusive.
-- **On-device calibration storage**: a spectral responsivity curve travels
-  with the sensor (LittleFS, CRC32-verified transfer). The Python driver uses it
-  for physical-unit conversion; the Rust driver currently exposes raw values and volts.
-- **Two drivers, one protocol** — Python (`lightmeter/sensor.py`) and Rust
-  (`rust/`, crate `lightmeter`), kept in lock-step by a semver rule (below).
-- **Live Tkinter GUI** — real-time plot with window-average / line-fit
-  overlays, unit switching (%, V, W/m², lux), CSV recording + reopenable plots.
+- Three measured acquisition profiles: filtered 20 SPS, interactive 330 SPS,
+  and maximum-rate 2 kSPS.
+- Continuous and finite binary streams with sequence numbers, RP2040 monotonic
+  timestamps, gain, clipping/autogain status, and temperature in every sample.
+- PGA gains 1× through 128×. Firmware-authoritative autogain keeps voltage
+  streams near 40–85% of ADC full scale when hardware range permits.
+- Canonical signed voltage output. Voltage normalization is gain-independent;
+  the active dark correction is applied last and never affects autogain or
+  clipping decisions.
+- Temporary session zero and an explicitly saved per-device flash baseline.
+  Persistent replacement is atomic and CRC32-checked.
+- Versioned protocol-3 COBS frames with payload length, request correlation,
+  CRC32, bounded frame size, and explicit stream start/stop/error events.
+- The GUI keeps serial ownership on one worker thread and writes one versioned
+  CSV per recorded stream.
 
 ## Hardware
 
 | Part | Role |
 |---|---|
-| ESP32-C3 SuperMini | MCU, native USB-CDC serial (no DTR/RTS reset quirks) |
-| ADS1115 | 16-bit ADC, I2C @ 0x48, single-shot @ 860 SPS |
-| OPA323 | Transimpedance amplifier off a BPW34 photodiode |
+| RP2040 | Acquisition, USB CDC, protocol, and persistence |
+| W25Q32JV | 4 MiB QSPI firmware/LittleFS flash and device identity |
+| ADS1220 | 24-bit differential ADC over SPI0 with dedicated DRDY |
+| TMP117 | Board temperature over I2C at `0x48` |
+| OPA323 + 2 MΩ / 3.3 pF | Fixed-gain photodiode transimpedance stage |
 
-I2C on GPIO4 (SDA) / GPIO3 (SCL) at 100 kHz (400 kHz was unreliable on this
-wiring). **Never exceed 3.6 V on an ADS1115 input**. The OPA323 output reaches
-about 3.266 V; firmware conservatively reports sensor saturation from 3.20 V.
-Datasheets for all three parts plus the enclosure are under `docs/`.
+The ADC measures `VOUT - 1.65 V BIAS` on `AIN0 - AIN1` using its internal
+2.048 V reference. ADC SPI is mode 1 at 1 MHz; TMP117 I2C runs at 400 kHz.
+See [`docs/v3/hardware.md`](docs/v3/hardware.md) before probing or changing pin
+assignments.
 
 ## Layout
 
-```
-firmware/lightsensor/lightsensor.ino   Arduino/ESP32-C3 firmware
-lightmeter/                            Python driver + Tkinter GUI
-rust/                                  Rust driver (crate `lightmeter`)
-docs/reference.md                      Serial protocol, driver API, calibration model
-docs/                                  Component datasheets
-tests/                                 Hand-rolled Python test scripts
-AGENTS.md                              Architecture, invariants, hardware gotchas
+```text
+firmware/lightsensor/lightsensor.ino  RP2040 production firmware
+lightmeter/sensor.py                  Python protocol-3 driver
+lightmeter/gui.py                     Tkinter streaming GUI and CSV recorder
+docs/reference.md                     Protocol and host API reference
+docs/v3/hardware.md                   Ordered-board electrical contract/results
+tests/test_protocol.py                Hardware-free protocol contracts
+tests/test_read.py                    Connected ten-sample smoke test
 ```
 
-## Quick start (Python)
+The final protocol-2 implementation is preserved by the immutable `v2-final`
+Git tag. It is not maintained in the active v3 tree.
+
+## Quick start
+
+Install the Arduino-Pico core once, then build or flash:
 
 ```bash
-uv sync                     # or: pip install -e .
-just flash                  # compile + upload firmware (port auto-detected)
-uv run python -m lightmeter.gui   # debug GUI (or just: lightmeter)
+just setup
+just compile
+just flash                       # defaults to /dev/ttyACM0
+SENSOR_PORT=/dev/ttyACM1 just flash
 ```
+
+Install/run Python with `uv`:
+
+```bash
+uv sync
+uv run python -m lightmeter.gui  # or installed command: lightmeter
+uv run tests/test_protocol.py
+uv run tests/test_read.py        # connected v3 board required
+uv run ruff check
+```
+
+The firmware USB descriptor is `LightSensor v3`, VID:PID `2e8a:f00a`. The flash
+UID is exposed as the 16-hex-digit USB serial number and protocol device ID, so
+`LightSensor(device_id="...")` can select one of several connected boards.
+
+## Python example
 
 ```python
-from lightmeter import LightSensor
+from lightmeter import LightSensor, StreamConfig, StreamMode, StreamStopped, VoltageSample
 
-with LightSensor() as sensor:        # port auto-detected
-    print(sensor.info)               # device identity / firmware
-    sensor.set_autogain(True)        # firmware autoexposes each read()
-    reading = sensor.read()          # Reading(value, sensor_sat, adc_sat)
-    print(sensor.gain, sensor.reading_voltage(reading))
+with LightSensor() as sensor:
+    print(sensor.info)
+    print(sensor.profiles)
+    sensor.start_stream(
+        StreamConfig(
+            mode=StreamMode.FINITE,
+            profile_id=1,
+            autogain=True,
+            window=8,
+            output_count=100,
+        )
+    )
+    while True:
+        event = sensor.read_event(5.0)
+        if isinstance(event, VoltageSample):
+            print(event.value, event.gain, event.temperature_c, event.status)
+        elif isinstance(event, StreamStopped):
+            break
 ```
 
-## Quick start (Rust)
+`LightSensor.zero(n)` acquires `n` uncorrected finite voltage samples at gain
+128×, installs their mean as the session dark correction, and returns the mean.
+`save_baseline()` is the explicit flash write. `clear_zero()` restores the
+persisted device baseline (or zero when no record exists).
 
-```rust
-use lightmeter::{LightSensor, SerialTransport};
+## Recording format
 
-let transport = SerialTransport::open(None)?; // port autodetected
-let mut sensor = LightSensor::new(transport)?;
-sensor.set_autogain(true)?;
-if let Some(reading) = sensor.read()? {
-    println!("{:.3} V (gain {})", sensor.reading_voltage(reading), sensor.gain);
-}
-```
+While recording is enabled, every stream gets a separate CSV under
+`recordings/`. A `stream_start` row records the complete effective profile,
+registers, rate, gain/autogain, averaging window, timestamps, and dark source.
+Every `sample` row records host UTC, RP2040 time, sequence, volts/raw code, gain,
+status, and temperature. Applying settings or changing dark correction causes
+an atomic stream replacement and therefore starts a new CSV.
 
-Hardware-free development and tests run against `lightmeter::sim::SimTransport`,
-which emulates the firmware's autoexposure line-by-line — no device needed.
-Built for the [pointcamera](https://github.com/eltsu7/pointcamera) turret rig;
-not yet published to crates.io, so consume it as a path or git dependency.
+## Current limits
 
-**Versioning contract:** each driver's package **major** version is pinned to
-the protocol version it speaks (`lightmeter==2.*` / `lightmeter = "2"` ⇒
-proto 2). A test in each driver enforces this — a `PROTO_VERSION` bump that
-forgets the matching package bump fails CI instead of shipping silently.
+- Absolute optical responsivity is uncalibrated; there is no W/m² or lux output.
+- The measured positive TIA clipping threshold is 1.64 V differential. Negative
+  TIA clipping remains unmeasured, so firmware does not assert that flag.
+- Warm-up drift is real but not modeled. TMP117 values are recorded as evidence,
+  not used for compensation.
+- Firmware updates use RP2040 ROM UF2 (`just flash`); there is no application OTA
+  or rollback slot.
+- The Rust protocol-2 driver was removed from the active tree. A protocol-3 Rust
+  driver remains deferred.
 
-## Protocol
-
-Single-char commands at 115200 baud over USB-CDC — read/average (`r`), manual
-or auto gain (`g`/`a`/`A`), identity handshake (`I`), device dark correction
-(`d`/`D`), and calibration blob transfer (`W`/`C`/`H`/`X`). Full command table,
-response formats, and the non-obvious contracts (resync-after-desync, throttled
-calibration upload, firmware-is-source-of-truth) are in
-[`docs/reference.md`](docs/reference.md).
-
-## Calibration status
-
-The Python conversion pipeline (spectral responsivity → volts → physical units,
-daylight/lux weighting) is built and unit-tested, but the absolute scale is still
-a datasheet-derived estimate (~±20%), not a measured calibration, and the bundled
-spectral curve is Vishay's typical BPW34 data, not a monochromator sweep of this
-specific sensor. `Calibration.provenance` always tells you which you have
-(`'measured'` vs `'datasheet-typical'`) — see
-[`docs/reference.md`](docs/reference.md). The Rust driver intentionally supports
-only raw values and volts today.
-
-## Development
-
-```bash
-uv run tests/test_calibration.py   # pure unit tests (no hardware)
-uv run tests/test_read.py          # smoke test: connect, read 10 samples (needs hardware)
-uv run ruff check                  # lint
-cd rust && cargo test              # Rust driver + sim tests (no hardware)
-just compile                       # firmware compile only
-```
-
-`tests/` uses a hand-rolled runner (functions named `test_*`), not pytest.
-See [`AGENTS.md`](AGENTS.md) for architecture and the invariants that are easy
-to break (voltage as the canonical unit, dark-offset ordering, thread-safety).
-
-## Roadmap
-
-See [`TODO.md`](TODO.md): absolute calibration reference measurement, thermal
-drift characterization, and a higher sample rate path (currently ~330
-reads/s, single-shot ADC mode).
-
-## License
-
-No repository-wide license file yet. The Rust crate (`rust/`) opts into
-`MIT OR Apache-2.0` via its `Cargo.toml`.
+See [`TODO.md`](TODO.md) for calibration and remaining characterization work.

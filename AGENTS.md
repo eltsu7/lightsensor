@@ -1,108 +1,157 @@
 # Repository Guidelines
 
-## Project Overview
+## Project overview
 
-`lightmeter` is a calibrated light-sensor system: a BPW34 photodiode and OPA323 front end feed an ADS1115 ADC on an ESP32-C3. The repository contains ESP32 firmware, Python driver/Tkinter debug GUI, and a separate Rust protocol-v2 driver.
+`lightmeter` is the production software for the ordered LightSensor PD Amp v3.0
+board. A BPW34/OPA323 fixed 2 MΩ transimpedance stage feeds an ADS1220; a bare
+RP2040 streams measurements over native USB CDC. Python provides the protocol-3
+driver, Tkinter GUI, and CSV recording.
 
-The firmware returns gain-relative raw ADC data over native USB-CDC; Python owns voltage and spectral/physical-unit conversion. Absolute calibration remains nominal until a reference measurement replaces the bundled datasheet-derived shape.
+The immutable `v2-final` Git tag preserves the retired ESP32-C3/ADS1115 protocol-2
+system. Do not add protocol-2 compatibility to the active tree. Rust, spectral
+calibration, physical-unit conversion, and temperature compensation are deferred.
 
-## Architecture & Data Flow
+## Architecture and data flow
 
 ```text
-BPW34 → OPA323 → ADS1115 → ESP32-C3 firmware → USB-CDC protocol v2
-                                                     ├─ Python LightSensor → GUI / calibration math
-                                                     └─ Rust driver
+BPW34 → OPA323 → ADS1220 → RP2040 protocol 3 → Python LightSensor
+                                                       ├─ SensorSampler → Tk GUI
+                                                       └─ versioned stream CSV
+TMP117 ────────────────────────────────────────────────────────────────┘
 ```
 
-- `firmware/lightsensor/lightsensor.ino` is the wire-protocol source of truth. It samples the ADS1115, performs autogain/averaging, reports raw counts plus saturation flags/gain, and stores calibration blobs in LittleFS.
-- `lightmeter/sensor.py` serializes host transactions, converts readings to canonical volts, provides dark-zero/autogain/calibration APIs, and validates calibration CRCs.
-- `lightmeter/gui.py` runs serial I/O in `SensorSampler`'s daemon thread; Tk only consumes locked snapshots and redraws independently.
-- Python and Rust share protocol version 2. A breaking wire change requires a `PROTO_VERSION` bump and matching driver package major versions.
+- `firmware/lightsensor/lightsensor.ino` is the protocol and measurement source
+  of truth. It owns ADS1220 configuration, DRDY acquisition, autogain, sliding
+  averaging, clipping flags, temperature reads, and atomic dark persistence.
+- `lightmeter/sensor.py` owns COBS/CRC framing, command correlation, handshake,
+  typed samples/events, UTC synchronization, and reconnect behavior.
+- `lightmeter/gui.py` keeps `SensorSampler` as the sole serial owner. Tk consumes
+  locked snapshots and never performs transport I/O.
+- `docs/reference.md` defines protocol 3 and the public Python workflow.
+- `docs/v3/hardware.md` is the ordered-board electrical contract and measured
+  bring-up record. Do not recover pins from memory.
 
-### Protocol and measurement invariants
+## Measurement and protocol invariants
 
-- USB-CDC uses 115200 baud and a compact single-character protocol; see `docs/reference.md`.
-- Firmware owns the gain table and saturation voltage; hosts mirror them only for conversion and mismatch warnings.
-- Preserve two distinct saturation modes: sensor rail saturation at high full-scale gains versus ADC-count saturation at lower full-scale gains.
-- Firmware-side autogain is authoritative: with autogain enabled, each read settles in the 40–90% full-scale band before averaging; a manual gain command disables it. Hosts record the returned gain and never calculate exposure steps.
-- Store/record **volts**, never gain-relative percent. Apply the active dark correction last for display; it must not affect autogain or saturation decisions. Firmware persists a device baseline (default `0.067144 V` from R1/R3); session `zero()` overrides it and `clear_zero()` restores it. Skip persistent writes when the requested value is within `100 µV`.
-- Calibration transfers are CRC32-verified and throttled: Python sends flushed 128-byte chunks with short pauses. Do not replace this with one bulk write.
-- On an interrupted/desynchronized calibration write, remain silent through the device timeout (up to 5 s); a ping resets the firmware payload timeout.
+- USB CDC uses binary protocol 3: COBS-delimited frames, fixed version/type/length
+  header, little-endian payloads, and CRC32. Maximum decoded frame is 256 bytes.
+- Connect with `HELLO`, `TIME_SYNC`, and `LIST_PROFILES`. Every request ID is
+  nonzero and unique among active commands. A stream emits no samples until its
+  exact start token is acknowledged within one second.
+- Stream configuration is atomic. `START_STREAM` carries format, mode, profile,
+  gain, autogain, averaging window, and finite output count. Changing acquisition
+  or dark state replaces the stream and produces a complete new header.
+- Sequence numbers restart at zero per stream. Every sample carries RP2040 time,
+  actual gain, status, and TMP117 temperature. Any protocol, ADC, temperature,
+  timing, overflow, or storage error stops acquisition.
+- Profiles are firmware-owned measured contracts: filtered 19.958 SPS,
+  interactive 327.876 SPS, and turbo 1949.3 SPS. Do not substitute ADS1220
+  datasheet nominal rates for the measured values.
+- Gains are 1×–128× (`gain = 2**gain_index`). Autogain is firmware-authoritative,
+  volts-only, one step per conversion, and targets 40–85% of full scale.
+- Preserve separate status mechanisms: positive/negative ADC full scale,
+  measured positive TIA clipping at 1.64 V differential, and autogain rail flags.
+  Negative TIA clipping remains unmeasured and must not be asserted.
+- Canonical voltage is signed `AIN0 - AIN1`, normalized independently for every
+  conversion before a sliding mean. Apply the active dark correction last. Dark
+  correction must never affect autogain or clipping.
+- Raw streams are gain-dependent evidence and cannot autogain. Store voltage for
+  normal measurements; never store gain-relative percentages.
+- Session zero overrides the persisted device baseline. `clear_zero()` restores
+  the device baseline. `save_baseline()` is the explicit atomic flash write.
+  Missing storage means `0.0 V`; corrupt/mount-failed storage is an explicit fault
+  and may only be repaired by device-ID-confirmed `RESET_STORAGE`.
+- TMP117 temperature is evidence only. No compensation or warm-up threshold is
+  approved.
 
-## Key Directories
+## Hardware constraints
 
-- `lightmeter/` — Python package: serial driver, port detection, Tkinter GUI, bundled calibration data.
-- `firmware/lightsensor/` — Arduino sketch; directory name must match the `.ino` file.
-- `rust/` — independent Rust 2024 protocol-v2 driver crate.
-- `tests/` — pure calibration contracts and hardware-connected read smoke script.
-- `data/` — calibration parser fixture.
-- `docs/` — protocol, hardware setup, calibration limitations, and component references.
-- `recordings/` — GUI output; ignored by Git.
+- RP2040 runs at 133 MHz from the ordered 12 MHz crystal and W25Q32 4 MiB QSPI
+  flash. The production build uses a 2 MiB sketch / 2 MiB LittleFS split.
+- ADS1220 SPI0 pins: GPIO0 MISO/DOUT, GPIO1 CS, GPIO2 SCLK, GPIO3 MOSI, GPIO4
+  DRDY. Use SPI mode 1 at 1 MHz, internal 2.048 V reference, continuous mode,
+  dedicated active-low DRDY, and `AIN0 - AIN1`.
+- TMP117 uses I2C1 on GPIO10/GPIO11 at 400 kHz, address `0x48`; ALERT is not
+  connected. A failed scheduled temperature read terminates the stream.
+- The analog front end is fixed 2 MΩ / 3.3 pF. There is no switched feedback
+  resistor and no external ADC reference.
+- Firmware USB identity is manufacturer `LightSensor`, product `LightSensor v3`,
+  VID:PID `2e8a:f00a`; USB serial and protocol ID are the flash UID.
 
-## Development Commands
+## Key paths
+
+- `firmware/lightsensor/lightsensor.ino` — production RP2040 firmware.
+- `lightmeter/sensor.py` — protocol constants, dataclasses, framing, and driver.
+- `lightmeter/gui.py` — worker-thread acquisition, plot, controls, and CSV writer.
+- `lightmeter/port_detect.py` — USB identity/device-ID discovery.
+- `lightmeter/__init__.py` — supported Python exports.
+- `tests/test_protocol.py` — hardware-free hand-rolled protocol contracts.
+- `tests/test_read.py` — connected ten-sample smoke script; do not discover/import.
+- `docs/reference.md` — canonical protocol and host reference.
+- `docs/v3/hardware.md` — electrical facts and measured characterization.
+- `justfile` — Arduino-Pico setup, compile, and UF2 upload recipes.
+
+## Development commands
 
 ```bash
 uv sync
-uv run python -m lightmeter.gui        # or installed: lightmeter
-uv run tests/test_calibration.py       # pure calibration/math checks
-uv run tests/test_read.py              # connected sensor required
+uv run tests/test_protocol.py
+uv run tests/test_read.py          # connected v3 board only
 uv run ruff check
 uv build
+uv run python -m lightmeter.gui
 
-just compile                           # ESP32-C3 firmware compile
-just upload                            # port detection + upload
-just flash                             # compile then upload
-
-cd rust && cargo test
+just setup                         # install Arduino-Pico core once
+just compile
+just upload                        # SENSOR_PORT defaults to /dev/ttyACM0
+just flash
 ```
 
-`just` uses `esp32:esp32:esp32c3:CDCOnBoot=cdc`; native USB CDC is required. For Arduino CLI setup and Linux serial permissions, follow `docs/reference.md`.
+Hold `BOOT`, pulse `RESET`, then release `BOOT` for manual ROM UF2 recovery.
 
-## Code Conventions & Common Patterns
+## Code conventions
 
 ### Python
 
-- Python >=3.13; Ruff line length is 100. Use 4-space indentation, `snake_case` functions/attributes, `PascalCase` classes/dataclasses, `UPPER_SNAKE_CASE` constants, and direct type annotations.
-- Keep the public surface explicit in `lightmeter/__init__.py`. Reuse module-level helpers such as `best_gain`, `parse_calibration`, and `autodetect_port`; avoid dependency-injection frameworks or new abstraction layers.
-- `LightSensor` owns a `threading.RLock`; every serial transaction must remain protected. Nested high-level calls rely on reentrancy.
-- Return `None`/`False` for malformed replies and expected protocol failures, with DEBUG/WARNING logging as appropriate. Link errors raise unless `auto_reconnect=True`; `reconnect()` returns `bool`.
-- `SensorSampler` is the sole GUI-side serial owner. Put requested state changes on its worker path, discard the transition sample after gain/autogain/zero changes, and protect UI snapshots with its lock. Session zeroing must not erase the persisted device baseline.
-- Invalidate cached calibration after successful device writes/erases. Validate complete length and CRC before parsing downloaded calibration.
+- Python >=3.13; Ruff line length 100. Use 4 spaces, direct type annotations,
+  `snake_case` functions, `PascalCase` classes/dataclasses, and uppercase constants.
+- Keep the public surface explicit in `lightmeter/__init__.py`. Prefer module
+  helpers and dataclasses over new framework layers.
+- `LightSensor` owns a `threading.RLock`; every serial command/read remains under
+  it. Preserve partial received frame bytes across serial timeouts.
+- Validate exact payload sizes, enum ranges, sequence semantics, COBS boundaries,
+  and CRC before accepting data. Device-reported errors are typed and must not be
+  hidden as empty samples.
+- Link reconnect performs a fresh handshake/time sync/profile read and remains
+  stopped. Never silently resume the prior stream.
+- `SensorSampler` is the GUI's sole serial owner. Queue controls onto its worker,
+  treat stream replacements as new sessions, and protect every UI snapshot.
+- Record one CSV per stream. Include the full effective start/config row and UTC,
+  device time, sequence, value, gain, status, and temperature for every sample.
 
 ### Firmware
 
-- Use existing Arduino style: two-space indentation, `camelCase` functions/state, `UPPER_SNAKE_CASE` constants, and single-threaded global state.
-- Preserve command framing/timeouts and reply formats. `g`/`a` commands require their value byte; `d<volts>\n` persists a validated device dark correction and `D` queries it; reads must keep their `raw,sensor_sat,adc_sat,gain` response shape.
-- Flash calibration writes intentionally buffer the complete payload before writing LittleFS so serial RX does not overrun during flash activity.
+- Use existing Arduino style: two-space indentation, `camelCase` functions/state,
+  uppercase constants, and single-threaded global state plus the minimal DRDY ISR.
+- Keep acquisition interrupt work bounded: only count events and capture time.
+  SPI, USB, filtering, state changes, and flash stay in the main loop.
+- No dynamic allocation in protocol/acquisition paths. Preserve the 256-byte
+  decoded limit, 258-byte COBS-body limit, and 1024-conversion window ceiling.
+- Do not silently drop samples or DRDY events. A gap/overflow is a terminal error.
+- Persistent writes stop/restart streams, write a CRC-protected temporary record,
+  flush, and atomically rename it. Never auto-format on mount/integrity failure.
+- A breaking wire change requires a protocol bump and matching Python package
+  major version.
 
-## Important Files
+## Testing and verification
 
-- `lightmeter/sensor.py` — `LightSensor`, `Reading`, `Calibration`, spectral conversion, protocol constants, reconnect and calibration transfer.
-- `lightmeter/gui.py` — `SensorSampler`, `SensorApp`, recording/plot helpers, CLI `main()`.
-- `lightmeter/port_detect.py` — VID/PID/hint/sole-port serial detection; runnable directly.
-- `lightmeter/__init__.py` — supported Python exports.
-- `firmware/lightsensor/lightsensor.ino` — protocol loop, ADS1115 acquisition/autogain, LittleFS calibration storage.
-- `docs/reference.md` — canonical protocol, calibration-transfer, hardware setup, and measurement-model details.
-- `README.md` — current project overview, quick start, and hardware safety limits.
-- `pyproject.toml`, `uv.lock`, `.python-version` — Python package/runtime policy.
-- `justfile` — firmware compile/upload/flash recipes.
-- `rust/Cargo.toml` — Rust driver manifest.
-
-## Runtime/Tooling Preferences
-
-- Use **uv** for Python environments and commands. Python is pinned to 3.13 (`.python-version`) and requires >=3.13.
-- Python package build backend is Hatchling; runtime dependencies are `pyserial` and `matplotlib`.
-- Use `arduino-cli` through `just` for firmware. Required board core/library setup is documented in `docs/reference.md`; firmware depends on `Adafruit ADS1X15`.
-- Rust is a separate edition-2024 crate under `rust/`; use Cargo from that directory.
-- Do not treat the bundled BPW34 calibration scale as a measured absolute calibration. Preserve provenance (`measured` versus `datasheet-typical`) and spectrum-dependent conversion behavior.
-- Current wiring and operational constraints belong in `README.md`/firmware; the exploratory LCD pin note is not authoritative for current sensor wiring.
-
-- Hardware limits: keep I2C at 100 kHz, never exceed 3.6 V at an ADS1115 input, and expect roughly 330 reads/s in single-shot mode because ALERT/RDY is grounded. Thermal downward drift is observed but not characterized.
-
-## Testing & QA
-
-- Tests use a hand-rolled runner, not pytest. Add deterministic module-level `test_<behavior>()` functions with plain `assert`s to `tests/test_calibration.py`; run it with `uv run tests/test_calibration.py`.
-- Use the local `approx()` helper for floating-point contracts and preserve `data/calibration_dummy.csv`'s parseable calibration-v1 metadata/schema.
-- `tests/test_read.py` opens hardware at module top level and takes 10 samples. Run only with a connected compatible device; do not blindly import or generic-discover it.
-- Test observable boundaries: interpolation endpoints/out-of-band behavior, zero response, gain-independent voltage, dark-offset ordering, CRC failures, and protocol/package-version compatibility.
-- Before yielding a permanent Python change, run the focused test path and `uv run ruff check`; compile firmware with `just compile` when modifying the sketch. Run `cd rust && cargo test` for Rust changes.
+- Tests use a hand-rolled runner, not pytest. Add deterministic module-level
+  `test_<behavior>()` functions with plain asserts to `tests/test_protocol.py`.
+- Protocol tests must defend observable framing, CRC, bounds, typed sample fields,
+  stream-state rules, and package/protocol-major compatibility.
+- `tests/test_read.py` opens hardware at module top level; run it only with the
+  production v3 board connected.
+- Before yielding a Python change, run `uv run tests/test_protocol.py` and
+  `uv run ruff check`. Exercise driver/GUI worker changes against hardware when
+  available. Compile firmware changes with `just compile`; flash and run the
+  changed acquisition path for behavioral firmware changes.
