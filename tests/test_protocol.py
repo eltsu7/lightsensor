@@ -52,6 +52,76 @@ def test_frame_version_and_size_rejection():
     )
 
 
+def test_encoded_frame_limit_applies_before_delimiter():
+    sensor = protocol.LightSensor("unused")
+    sensor._rx.extend(b"x" * (protocol.MAX_ENCODED_FRAME + 1) + b"\0")
+    assert_raises(protocol.ProtocolError, lambda: sensor._read_encoded(0.01))
+
+
+def test_terminal_device_error_clears_stream_state():
+    sensor = protocol.LightSensor("unused")
+    sensor.stream_header = object()
+    payload = struct.pack("<IQIHH", 7, 1234, 0xFFFFFFFF, 7, 0)
+    sensor._read_message = lambda timeout: (protocol.MSG_ERROR, payload)
+    assert_raises(protocol.DeviceError, lambda: sensor._wait_for(7, {protocol.MSG_OK}))
+    assert sensor.stream_header is None
+
+
+def test_reconnect_failure_does_not_recurse():
+    class FailingWriteSerial:
+        def __init__(self, *args, **kwargs):
+            self.is_open = True
+
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def write(self, frame):
+            raise protocol.serial.SerialException("write failed")
+
+        def close(self):
+            self.is_open = False
+
+    real_serial = protocol.serial.Serial
+    log_disabled = protocol.log.disabled
+    protocol.serial.Serial = FailingWriteSerial
+    protocol.log.disabled = True
+    sensor = protocol.LightSensor("unused", auto_reconnect=True)
+    try:
+        assert_raises(ConnectionError, sensor.connect)
+    finally:
+        protocol.serial.Serial = real_serial
+        protocol.log.disabled = log_disabled
+        sensor.close()
+
+
+def test_connect_reset_failure_closes_serial_handle():
+    instances = []
+
+    class FailingResetSerial:
+        def __init__(self, *args, **kwargs):
+            self.is_open = True
+            instances.append(self)
+
+        def reset_input_buffer(self):
+            raise protocol.serial.SerialException("reset failed")
+
+        def close(self):
+            self.is_open = False
+
+    real_serial = protocol.serial.Serial
+    protocol.serial.Serial = FailingResetSerial
+    sensor = protocol.LightSensor("unused")
+    try:
+        assert_raises(protocol.serial.SerialException, sensor.connect)
+    finally:
+        protocol.serial.Serial = real_serial
+    assert sensor.ser is None
+    assert not instances[0].is_open
+
+
 def test_stream_config_contracts():
     continuous = protocol.StreamConfig()
     assert continuous.gain == 1

@@ -360,6 +360,7 @@ class LightSensor:
         self._rx = bytearray()
         self._events = deque()
         self._lock = threading.RLock()
+        self._reconnecting = False
 
     @property
     def connected(self):
@@ -392,6 +393,9 @@ class LightSensor:
         while True:
             delimiter = self._rx.find(0)
             if delimiter >= 0:
+                if delimiter > MAX_ENCODED_FRAME:
+                    del self._rx[: delimiter + 1]
+                    raise ProtocolError("encoded frame exceeds protocol limit")
                 frame = bytes(self._rx[:delimiter])
                 del self._rx[: delimiter + 1]
                 if frame:
@@ -523,6 +527,7 @@ class LightSensor:
             if message_type == MSG_ERROR:
                 event = self._parse_error(payload)
                 if event.request_id in (0, request_id):
+                    self.stream_header = None
                     raise DeviceError(event)
                 self._events.append(event)
                 continue
@@ -537,18 +542,18 @@ class LightSensor:
             if self.connected:
                 return self.info
             port = self.port or autodetect_port(self.requested_device_id)
-            self.ser = serial.Serial(
-                port,
-                BAUD_RATE,
-                timeout=0.05,
-                write_timeout=self.timeout,
-            )
-            self.port = port
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-            self._rx.clear()
-            self._events.clear()
             try:
+                self.ser = serial.Serial(
+                    port,
+                    BAUD_RATE,
+                    timeout=0.05,
+                    write_timeout=self.timeout,
+                )
+                self.port = port
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                self._rx.clear()
+                self._events.clear()
                 request_id = self._next_request_id()
                 self._write_request(MSG_HELLO, request_id)
                 _, payload = self._wait_for(request_id, {MSG_HELLO_REPLY})
@@ -807,15 +812,22 @@ class LightSensor:
             return True
 
     def reconnect(self):
-        port = self.port if self._explicit_port else None
-        self.close()
-        self.port = port
-        try:
-            self.connect()
-        except (ConnectionError, OSError, ProtocolError, serial.SerialException):
-            log.warning("LightSensor reconnect failed", exc_info=True)
-            return False
-        return True
+        with self._lock:
+            if self._reconnecting:
+                return False
+            self._reconnecting = True
+            try:
+                port = self.port if self._explicit_port else None
+                self.close()
+                self.port = port
+                try:
+                    self.connect()
+                except (ConnectionError, OSError, ProtocolError, serial.SerialException):
+                    log.warning("LightSensor reconnect failed", exc_info=True)
+                    return False
+                return True
+            finally:
+                self._reconnecting = False
 
     def close(self):
         with self._lock:
