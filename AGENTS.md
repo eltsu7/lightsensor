@@ -122,8 +122,9 @@ Hold `BOOT`, pulse `RESET`, then release `BOOT` for manual ROM UF2 recovery.
 - Validate exact payload sizes, enum ranges, sequence semantics, COBS boundaries,
   and CRC before accepting data. Device-reported errors are typed and must not be
   hidden as empty samples.
-- Link reconnect performs a fresh handshake/time sync/profile read and remains
-  stopped. Never silently resume the prior stream.
+- Link reconnect performs a fresh handshake/time sync/profile read, remains
+  stopped, and stays bound to the original flash UID. Never silently resume the
+  prior stream or select another device.
 - `SensorSampler` is the GUI's sole serial owner. Queue controls onto its worker,
   treat stream replacements as new sessions, and protect every UI snapshot.
 - Record one CSV per stream. Include the full effective start/config row and UTC,

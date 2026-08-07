@@ -95,6 +95,7 @@ class SensorSampler:
         self._connected = False
         self._acquiring = False
         self._info = None
+        self._device_id = None
         self._profiles = ()
         self._header = None
         self._times = deque(maxlen=MAX_POINTS)
@@ -203,7 +204,7 @@ class SensorSampler:
             self._gap_count = 0
 
     def _stream_started(self, header):
-        self._close_recording_file()
+        close_error = self._close_recording_file()
         self._clear_plot_state()
         with self._lock:
             self._header = header
@@ -213,16 +214,20 @@ class SensorSampler:
                 f"Streaming {header.measured_sps:.3f} SPS — "
                 f"{header.config.window}-conversion mean"
             )
+            if close_error is not None:
+                self._status += f"; recording disabled: {close_error}"
             recording = self._recording
         if recording:
             self._open_recording_file(header)
 
     def _stream_ended(self, status):
-        self._close_recording_file()
+        close_error = self._close_recording_file()
         with self._lock:
             self._header = None
             self._acquiring = False
             self._status = status
+            if close_error is not None:
+                self._status += f"; recording disabled: {close_error}"
             self._expected_sequence = None
 
     def _profile_name(self, profile_id):
@@ -231,55 +236,94 @@ class SensorSampler:
                 return profile.name
         return str(profile_id)
 
+    def _recording_failed(self, error, *, partial_path=None):
+        file = self._record_file
+        self._record_file = None
+        self._record_writer = None
+        if file is not None:
+            try:
+                file.close()
+            except (OSError, ValueError):
+                pass
+        cleanup_error = None
+        if partial_path is not None:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_error = exc
+        with self._lock:
+            self._recording = False
+            self._recording_path = None
+            self._status = f"Recording failed: {error}; stream continues"
+            if cleanup_error is not None:
+                self._status += f"; incomplete file could not be removed: {cleanup_error}"
+
     def _open_recording_file(self, header):
-        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-        started = datetime.now(timezone.utc)
-        path = RECORDINGS_DIR / (
-            f"stream_{started:%Y-%m-%dT%H-%M-%S.%fZ}_"
-            f"{header.stream_start_device_us}.csv"
-        )
-        file = open(path, "w", newline="")
-        writer = csv.DictWriter(file, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        registers = "".join(f"{value:02X}" for value in header.registers)
-        writer.writerow(
-            {
-                "row_type": "stream_start",
-                "host_utc_us": header.stream_start_utc_us,
-                "stream_start_device_us": header.stream_start_device_us,
-                "stream_start_utc_us": header.stream_start_utc_us,
-                "format": header.config.format.name.lower(),
-                "mode": header.config.mode.name.lower(),
-                "profile_id": header.config.profile_id,
-                "profile_name": self._profile_name(header.config.profile_id),
-                "measured_sps": header.measured_sps,
-                "gain_index": header.config.gain_index,
-                "gain": header.config.gain,
-                "autogain": int(header.config.autogain),
-                "window": header.config.window,
-                "output_count": header.config.output_count,
-                "registers_hex": registers,
-                "dark_source": header.dark_source,
-                "active_dark_volts": header.active_dark_volts,
-            }
-        )
-        file.flush()
-        self._record_file = file
-        self._record_writer = writer
+        path = None
+        try:
+            RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+            started = datetime.now(timezone.utc)
+            path = RECORDINGS_DIR / (
+                f"stream_{started:%Y-%m-%dT%H-%M-%S.%fZ}_"
+                f"{header.stream_start_device_us}.csv"
+            )
+            self._record_file = open(path, "w", newline="")
+            self._record_writer = csv.DictWriter(self._record_file, fieldnames=CSV_COLUMNS)
+            self._record_writer.writeheader()
+            registers = "".join(f"{value:02X}" for value in header.registers)
+            self._record_writer.writerow(
+                {
+                    "row_type": "stream_start",
+                    "host_utc_us": header.stream_start_utc_us,
+                    "stream_start_device_us": header.stream_start_device_us,
+                    "stream_start_utc_us": header.stream_start_utc_us,
+                    "format": header.config.format.name.lower(),
+                    "mode": header.config.mode.name.lower(),
+                    "profile_id": header.config.profile_id,
+                    "profile_name": self._profile_name(header.config.profile_id),
+                    "measured_sps": header.measured_sps,
+                    "gain_index": header.config.gain_index,
+                    "gain": header.config.gain,
+                    "autogain": int(header.config.autogain),
+                    "window": header.config.window,
+                    "output_count": header.config.output_count,
+                    "registers_hex": registers,
+                    "dark_source": header.dark_source,
+                    "active_dark_volts": header.active_dark_volts,
+                }
+            )
+            self._record_file.flush()
+        except (OSError, csv.Error, ValueError) as exc:
+            self._recording_failed(exc, partial_path=path)
+            return False
         self._record_last_flush = time.monotonic()
         with self._lock:
             self._recording_path = path
             self._last_recording_path = path
             self._recording_count = 0
+        return True
 
     def _close_recording_file(self):
-        if self._record_file is not None:
-            self._record_file.flush()
-            self._record_file.close()
+        file = self._record_file
         self._record_file = None
         self._record_writer = None
         with self._lock:
             self._recording_path = None
+        if file is None:
+            return None
+        try:
+            file.flush()
+            file.close()
+        except (OSError, ValueError) as exc:
+            try:
+                file.close()
+            except (OSError, ValueError):
+                pass
+            with self._lock:
+                self._recording = False
+                self._status = f"Recording close failed: {exc}; recording disabled"
+            return exc
+        return None
 
     def _record_sample(self, sample):
         if self._record_writer is None or self._header is None:
@@ -289,31 +333,34 @@ class SensorSampler:
             sample.device_timestamp_us - header.stream_start_device_us
         )
         is_volts = isinstance(sample, VoltageSample)
-        self._record_writer.writerow(
-            {
-                "row_type": "sample",
-                "host_utc_us": utc_us,
-                "device_timestamp_us": sample.device_timestamp_us,
-                "sequence": sample.sequence,
-                "volts": sample.value if is_volts else "",
-                "raw_code": "" if is_volts else sample.value,
-                "gain_index": sample.gain_index,
-                "gain": sample.gain,
-                "status": int(sample.status),
-                "temperature_c": sample.temperature_c,
-                "stream_start_device_us": header.stream_start_device_us,
-                "stream_start_utc_us": header.stream_start_utc_us,
-                "format": header.config.format.name.lower(),
-                "profile_id": header.config.profile_id,
-                "profile_name": self._profile_name(header.config.profile_id),
-            }
-        )
-        with self._lock:
-            self._recording_count += 1
-        now = time.monotonic()
-        if now - self._record_last_flush >= 1.0:
-            self._record_file.flush()
-            self._record_last_flush = now
+        try:
+            self._record_writer.writerow(
+                {
+                    "row_type": "sample",
+                    "host_utc_us": utc_us,
+                    "device_timestamp_us": sample.device_timestamp_us,
+                    "sequence": sample.sequence,
+                    "volts": sample.value if is_volts else "",
+                    "raw_code": "" if is_volts else sample.value,
+                    "gain_index": sample.gain_index,
+                    "gain": sample.gain,
+                    "status": int(sample.status),
+                    "temperature_c": sample.temperature_c,
+                    "stream_start_device_us": header.stream_start_device_us,
+                    "stream_start_utc_us": header.stream_start_utc_us,
+                    "format": header.config.format.name.lower(),
+                    "profile_id": header.config.profile_id,
+                    "profile_name": self._profile_name(header.config.profile_id),
+                }
+            )
+            with self._lock:
+                self._recording_count += 1
+            now = time.monotonic()
+            if now - self._record_last_flush >= 1.0:
+                self._record_file.flush()
+                self._record_last_flush = now
+        except (OSError, csv.Error, ValueError) as exc:
+            self._recording_failed(exc)
 
     def _handle_sample(self, sample):
         now = time.perf_counter()
@@ -349,14 +396,17 @@ class SensorSampler:
                     return
                 self._recording = True
             if self._header is not None:
-                self._open_recording_file(self._header)
-            self._set_status("Recording" if self._header else "Recording armed")
+                if self._open_recording_file(self._header):
+                    self._set_status("Recording")
+            else:
+                self._set_status("Recording armed")
             return
         if action == "record_off":
             with self._lock:
                 self._recording = False
-            self._close_recording_file()
-            self._set_status("Streaming" if self._header else "Stopped")
+            close_error = self._close_recording_file()
+            if close_error is None:
+                self._set_status("Streaming" if self._header else "Stopped")
             return
         if action == "pause":
             if self._header is not None:
@@ -371,8 +421,11 @@ class SensorSampler:
             self._stream_started(header)
             return
         if action == "zero":
-            self._close_recording_file()
-            self._set_status(f"Measuring dark baseline over {value} samples", acquiring=False)
+            close_error = self._close_recording_file()
+            status = f"Measuring dark baseline over {value} samples"
+            if close_error is not None:
+                status += f"; recording disabled: {close_error}"
+            self._set_status(status, acquiring=False)
             baseline = sensor.zero(
                 value,
                 profile_id=self._desired_config.profile_id,
@@ -410,8 +463,13 @@ class SensorSampler:
                 if sensor is None:
                     self._set_status("Connecting", acquiring=False)
                     try:
-                        sensor = LightSensor(self.port, timeout=self.timeout)
+                        sensor = LightSensor(
+                            self.port,
+                            timeout=self.timeout,
+                            device_id=self._device_id,
+                        )
                         info = sensor.connect()
+                        self._device_id = info.device_id
                         with self._lock:
                             self._connected = True
                             self._info = info
@@ -709,7 +767,7 @@ class SensorApp:
             return
         try:
             open_recording_plot(self.root, path)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, KeyError, csv.Error) as exc:
             messagebox.showerror("Recording", str(exc), parent=self.root)
 
     def _redraw(self):

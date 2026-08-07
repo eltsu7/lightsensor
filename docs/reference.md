@@ -249,11 +249,15 @@ Important methods:
 `read_event()` returns `RawSample`, `VoltageSample`, `StreamStopped`, or
 `ErrorEvent`. Matching command errors raise `DeviceError`; malformed host-side
 frames raise `ProtocolError`; serial link failures raise `ConnectionError`.
+Reconnects repeat the full handshake and remain bound to the first connected
+flash UID; they never select a different LightSensor or resume acquisition.
 
 The Tk GUI's `SensorSampler` is the sole serial owner. Controls enqueue work onto
 its daemon thread; Tk only reads locked snapshots. Applying acquisition or dark
 settings causes a complete stream replacement. CSV files use a fixed column
 schema with one `stream_start` metadata row followed by `sample` rows.
+If opening, writing, flushing, or closing a CSV fails, recording is disabled and
+the GUI reports the error while acquisition continues.
 
 ## Firmware build and recovery
 

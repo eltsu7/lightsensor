@@ -121,6 +121,8 @@ registers, rate, gain/autogain, averaging window, timestamps, and dark source.
 Every `sample` row records host UTC, RP2040 time, sequence, volts/raw code, gain,
 status, and temperature. Applying settings or changing dark correction causes
 an atomic stream replacement and therefore starts a new CSV.
+If CSV I/O fails, the GUI disables recording and reports the error without
+stopping sensor acquisition.
 
 ## Current limits
 

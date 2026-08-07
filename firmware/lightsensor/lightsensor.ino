@@ -448,7 +448,7 @@ void clearDrdyEvents() {
 
 void onAdcDrdy() {
   lastDrdyTimestampUs = time_us_64();
-  drdyEvents++;
+  if (drdyEvents != UINT32_MAX) drdyEvents++;
 }
 
 bool takeDrdyEvents(uint32_t &events, uint64_t &timestampUs) {

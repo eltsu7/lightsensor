@@ -8,13 +8,22 @@ USB_VID_PID = (0x2E8A, 0xF00A)
 USB_PRODUCT = "lightsensor v3"
 
 
+def _normalize_device_id(device_id):
+    if device_id is None:
+        return None
+    if not isinstance(device_id, str):
+        raise TypeError("device_id must be a 16-hex-digit string")
+    normalized = device_id.strip().upper()
+    if len(normalized) != 16 or any(character not in "0123456789ABCDEF" for character in normalized):
+        raise ValueError("device_id must be exactly 16 hexadecimal digits")
+    return normalized
+
+
 def _is_lightsensor(port):
     product = (port.product or "").strip().lower()
-    manufacturer = (port.manufacturer or "").strip().lower()
     description = (port.description or "").lower()
-    return product == USB_PRODUCT or (
-        (port.vid, port.pid) == USB_VID_PID
-        and (manufacturer == "lightsensor" or USB_PRODUCT in description)
+    return (port.vid, port.pid) == USB_VID_PID and (
+        product == USB_PRODUCT or USB_PRODUCT in description
     )
 
 
@@ -24,7 +33,7 @@ def autodetect_port(device_id=None):
     ``device_id`` optionally selects the uppercase W25Q32 UID exposed as the USB
     serial number. Protocol identity is still verified by :class:`LightSensor`.
     """
-    requested = device_id.upper() if device_id else None
+    requested = _normalize_device_id(device_id)
     ports = list(serial.tools.list_ports.comports())
     candidates = [port for port in ports if _is_lightsensor(port)]
     if requested:

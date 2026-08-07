@@ -10,7 +10,7 @@ import time
 
 import serial
 
-from lightmeter.port_detect import autodetect_port
+from lightmeter.port_detect import _normalize_device_id, autodetect_port
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,16 @@ CAP_TEMPERATURE = 1 << 4
 CAP_SESSION_DARK = 1 << 5
 CAP_PERSISTENT_DARK = 1 << 6
 CAP_STORAGE_RESET = 1 << 7
+REQUIRED_CAPABILITIES = (
+    CAP_RAW_STREAM
+    | CAP_VOLTS_STREAM
+    | CAP_FINITE_STREAM
+    | CAP_VOLTS_AUTOGAIN
+    | CAP_TEMPERATURE
+    | CAP_SESSION_DARK
+    | CAP_PERSISTENT_DARK
+    | CAP_STORAGE_RESET
+)
 
 
 class StreamFormat(IntEnum):
@@ -114,6 +124,14 @@ class SampleStatus(IntFlag):
     AUTOGAIN_OVERRANGE = 1 << 4
     AUTOGAIN_UNDERRANGE = 1 << 5
 
+SAMPLE_STATUS_MASK = (
+    SampleStatus.ADC_POSITIVE_CLIP
+    | SampleStatus.ADC_NEGATIVE_CLIP
+    | SampleStatus.TIA_POSITIVE_CLIP
+    | SampleStatus.AUTOGAIN_OVERRANGE
+    | SampleStatus.AUTOGAIN_UNDERRANGE
+)
+
 
 @dataclass(frozen=True)
 class DeviceInfo:
@@ -147,12 +165,26 @@ class StreamConfig:
     output_count: int = 0
 
     def __post_init__(self):
+        if not isinstance(self.format, StreamFormat):
+            raise TypeError("format must be StreamFormat")
+        if not isinstance(self.mode, StreamMode):
+            raise TypeError("mode must be StreamMode")
+        if type(self.profile_id) is not int:
+            raise TypeError("profile_id must be int")
         if not 0 <= self.profile_id <= 255:
             raise ValueError("profile_id must fit in u8")
+        if type(self.gain_index) is not int:
+            raise TypeError("gain_index must be int")
         if not 0 <= self.gain_index <= 7:
-            raise ValueError("gain_index must be 0..7")
+            raise ValueError("gain_index must be from 0 through 7")
+        if type(self.autogain) is not bool:
+            raise TypeError("autogain must be bool")
+        if type(self.window) is not int:
+            raise TypeError("window must be int")
         if not 1 <= self.window <= MAX_WINDOW:
-            raise ValueError(f"window must be 1..{MAX_WINDOW}")
+            raise ValueError(f"window must be from 1 through {MAX_WINDOW}")
+        if type(self.output_count) is not int:
+            raise TypeError("output_count must be int")
         if self.format is StreamFormat.RAW and self.autogain:
             raise ValueError("raw streams cannot use autogain")
         if self.mode is StreamMode.CONTINUOUS and self.output_count != 0:
@@ -256,6 +288,13 @@ class DeviceError(RuntimeError):
         super().__init__(f"{event.message} (code={event.code}, detail={event.detail})")
 
 
+def _protocol_enum(enum_type, value, field):
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise ProtocolError(f"invalid {field} value {value}") from exc
+
+
 def _cobs_encode(data):
     output = bytearray([0])
     code_index = 0
@@ -351,7 +390,7 @@ class LightSensor:
         self._explicit_port = port is not None
         self.timeout = timeout
         self.auto_reconnect = auto_reconnect
-        self.requested_device_id = device_id.upper() if device_id else None
+        self.requested_device_id = _normalize_device_id(device_id)
         self.ser = None
         self.info = None
         self.profiles = ()
@@ -434,19 +473,30 @@ class LightSensor:
     def _parse_sample(self, message_type, payload):
         if len(payload) != 22:
             raise ProtocolError("invalid sample payload length")
+        if message_type not in (MSG_SAMPLE_RAW, MSG_SAMPLE_VOLTS):
+            raise ProtocolError(f"invalid sample message type 0x{message_type:02X}")
         sequence, timestamp, gain_index, status = struct.unpack_from("<IQBB", payload)
         temperature = struct.unpack_from("<f", payload, 18)[0]
+        if gain_index > 7:
+            raise ProtocolError(f"invalid sample gain index {gain_index}")
+        if status & ~int(SAMPLE_STATUS_MASK):
+            raise ProtocolError(f"invalid sample status bits 0x{status:02X}")
+        if not math.isfinite(temperature) or not -55.0 <= temperature <= 150.0:
+            raise ProtocolError(f"invalid sample temperature {temperature}")
+        sample_status = SampleStatus(status)
         if message_type == MSG_SAMPLE_RAW:
             value = struct.unpack_from("<i", payload, 14)[0]
-            return RawSample(sequence, timestamp, gain_index, SampleStatus(status), value, temperature)
+            return RawSample(sequence, timestamp, gain_index, sample_status, value, temperature)
         value = struct.unpack_from("<f", payload, 14)[0]
-        return VoltageSample(sequence, timestamp, gain_index, SampleStatus(status), value, temperature)
+        if not math.isfinite(value):
+            raise ProtocolError(f"invalid sample voltage {value}")
+        return VoltageSample(sequence, timestamp, gain_index, sample_status, value, temperature)
 
     def _parse_stopped(self, payload):
         if len(payload) != 17:
             raise ProtocolError("invalid STREAM_STOPPED payload length")
         request_id, token, count, reason = struct.unpack("<IQIB", payload)
-        return StreamStopped(request_id, token, count, StopReason(reason))
+        return StreamStopped(request_id, token, count, _protocol_enum(StopReason, reason, "stop reason"))
 
     def _parse_header(self, payload):
         reader = _PayloadReader(payload)
@@ -463,15 +513,32 @@ class LightSensor:
         dark_volts = reader.unpack("<f")[0]
         temperature_period = reader.unpack("<I")[0]
         reader.finish()
-        config = StreamConfig(
-            StreamFormat(format_),
-            StreamMode(mode),
-            profile_id,
-            gain_index,
-            bool(autogain),
-            window,
-            count,
-        )
+        if autogain not in (0, 1):
+            raise ProtocolError(f"invalid stream autogain value {autogain}")
+        if dark_source not in (0, 1):
+            raise ProtocolError(f"invalid stream dark source {dark_source}")
+        if measured_millisps == 0:
+            raise ProtocolError("stream measured rate must be positive")
+        if gain_mask == 0 or gain_index > 7 or not gain_mask & (1 << gain_index):
+            raise ProtocolError("stream gain is not permitted by its profile")
+        if not 0 <= low < high <= 32768 or hysteresis > 32768:
+            raise ProtocolError("invalid stream autogain thresholds")
+        if not math.isfinite(dark_volts) or abs(dark_volts) > MAX_DARK_OFFSET_V:
+            raise ProtocolError(f"invalid stream dark correction {dark_volts}")
+        if temperature_period == 0:
+            raise ProtocolError("stream temperature period must be positive")
+        try:
+            config = StreamConfig(
+                _protocol_enum(StreamFormat, format_, "stream format"),
+                _protocol_enum(StreamMode, mode, "stream mode"),
+                profile_id,
+                gain_index,
+                bool(autogain),
+                window,
+                count,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(f"invalid stream configuration: {exc}") from exc
         return StreamHeader(
             request_id,
             token,
@@ -492,20 +559,45 @@ class LightSensor:
     def _parse_status(self, payload):
         if len(payload) != 30:
             raise ProtocolError("invalid STATUS payload length")
-        values = struct.unpack("<IBBBBfffQH", payload)
-        session_dark = None if math.isnan(values[6]) else values[6]
-        temperature = None if math.isnan(values[7]) else values[7]
+        (
+            request_id,
+            state,
+            time_synchronized,
+            storage_state,
+            dark_source,
+            device_dark,
+            session_dark_value,
+            temperature_value,
+            monotonic_us,
+            last_error,
+        ) = struct.unpack("<IBBBBfffQH", payload)
+        if time_synchronized not in (0, 1):
+            raise ProtocolError(f"invalid time synchronization value {time_synchronized}")
+        if dark_source not in (0, 1):
+            raise ProtocolError(f"invalid status dark source {dark_source}")
+        if not math.isfinite(device_dark) or abs(device_dark) > MAX_DARK_OFFSET_V:
+            raise ProtocolError(f"invalid device dark correction {device_dark}")
+        session_dark = None if math.isnan(session_dark_value) else session_dark_value
+        if session_dark is not None and (
+            not math.isfinite(session_dark) or abs(session_dark) > MAX_DARK_OFFSET_V
+        ):
+            raise ProtocolError(f"invalid session dark correction {session_dark}")
+        temperature = None if math.isnan(temperature_value) else temperature_value
+        if temperature is not None and (
+            not math.isfinite(temperature) or not -55.0 <= temperature <= 150.0
+        ):
+            raise ProtocolError(f"invalid status temperature {temperature}")
         return DeviceStatus(
-            values[0],
-            DeviceState(values[1]),
-            bool(values[2]),
-            StorageState(values[3]),
-            values[4],
-            values[5],
+            request_id,
+            _protocol_enum(DeviceState, state, "device state"),
+            bool(time_synchronized),
+            _protocol_enum(StorageState, storage_state, "storage state"),
+            dark_source,
+            device_dark,
             session_dark,
             temperature,
-            values[8],
-            values[9],
+            monotonic_us,
+            last_error,
         )
 
     def _event_from_message(self, message_type, payload):
@@ -531,6 +623,10 @@ class LightSensor:
                     raise DeviceError(event)
                 self._events.append(event)
                 continue
+            if len(payload) < 4:
+                raise ProtocolError(
+                    f"response type 0x{message_type:02X} has no complete request ID"
+                )
             if message_type in accepted_types:
                 response_id = struct.unpack_from("<I", payload)[0]
                 if response_id == request_id:
@@ -560,6 +656,10 @@ class LightSensor:
                 if len(payload) != 24:
                     raise ProtocolError("invalid HELLO_REPLY payload length")
                 values = struct.unpack("<IBBBBIHQBB", payload)
+                if values[8] not in (0, 1):
+                    raise ProtocolError(f"invalid HELLO time synchronization value {values[8]}")
+                if values[7] == 0:
+                    raise ProtocolError("invalid all-zero device ID")
                 info = DeviceInfo(
                     (values[1], values[2], values[3]),
                     values[4],
@@ -567,10 +667,23 @@ class LightSensor:
                     values[6],
                     f"{values[7]:016X}",
                     bool(values[8]),
-                    StorageState(values[9]),
+                    _protocol_enum(StorageState, values[9], "HELLO storage state"),
                 )
                 if info.hardware_major != HARDWARE_MAJOR:
                     raise ProtocolError(f"unsupported hardware generation {info.hardware_major}")
+                if info.firmware_version[0] != PROTO_VERSION:
+                    raise ProtocolError(
+                        f"unsupported firmware major {info.firmware_version[0]}"
+                    )
+                if info.maximum_decoded_frame != MAX_DECODED_FRAME:
+                    raise ProtocolError(
+                        "device maximum decoded frame does not match protocol contract"
+                    )
+                missing_capabilities = REQUIRED_CAPABILITIES & ~info.capabilities
+                if missing_capabilities:
+                    raise ProtocolError(
+                        f"device lacks required capabilities 0x{missing_capabilities:02X}"
+                    )
                 if self.requested_device_id and info.device_id != self.requested_device_id:
                     raise ProtocolError(
                         f"connected device {info.device_id}, requested {self.requested_device_id}"
@@ -606,6 +719,8 @@ class LightSensor:
             response_id, echoed_utc, device_us = struct.unpack("<IQQ", payload)
             if response_id != request_id or echoed_utc != utc_us:
                 raise ProtocolError("time synchronization reply mismatch")
+            self.stream_header = None
+            self._events.clear()
             return echoed_utc, device_us
 
     def ping(self):
@@ -628,8 +743,11 @@ class LightSensor:
             if response_id != request_id:
                 raise ProtocolError("profile reply request mismatch")
             profiles = []
+            profile_ids = set()
             for _ in range(count):
                 profile_id, name_length = reader.unpack("<BB")
+                if profile_id in profile_ids:
+                    raise ProtocolError(f"duplicate profile ID {profile_id}")
                 try:
                     name = reader.take(name_length).decode("ascii")
                 except UnicodeDecodeError as exc:
@@ -638,6 +756,13 @@ class LightSensor:
                 registers = reader.unpack("<BBBB")
                 gain_mask = reader.unpack("<B")[0]
                 discard = reader.unpack("<H")[0]
+                if not name:
+                    raise ProtocolError(f"profile {profile_id} has an empty name")
+                if measured_millisps == 0:
+                    raise ProtocolError(f"profile {profile_id} has a zero measured rate")
+                if gain_mask == 0:
+                    raise ProtocolError(f"profile {profile_id} permits no gains")
+                profile_ids.add(profile_id)
                 profiles.append(
                     Profile(
                         profile_id,
@@ -649,6 +774,8 @@ class LightSensor:
                     )
                 )
             reader.finish()
+            if not profiles:
+                raise ProtocolError("device reported no acquisition profiles")
             return tuple(profiles)
 
     def get_status(self):
@@ -733,6 +860,8 @@ class LightSensor:
         header = self._parse_header(response)
         self._events.clear()
         return self._ack_header(header)
+
+
     def _set_storage_state(self, state):
         if self.info is not None:
             self.info = DeviceInfo(
@@ -799,7 +928,7 @@ class LightSensor:
         with self._lock:
             if self.info is None:
                 raise RuntimeError("sensor is not connected")
-            normalized = confirm_device_id.upper()
+            normalized = _normalize_device_id(confirm_device_id)
             if normalized != self.info.device_id:
                 raise ValueError(f"confirmation must equal device ID {self.info.device_id}")
             request_id = self._next_request_id()
@@ -808,6 +937,8 @@ class LightSensor:
             _, response = self._wait_for(request_id, {MSG_OK})
             if response != struct.pack("<IB", request_id, MSG_RESET_STORAGE):
                 raise ProtocolError("invalid RESET_STORAGE reply")
+            self.stream_header = None
+            self._events.clear()
             self._set_storage_state(StorageState.EMPTY)
             return True
 

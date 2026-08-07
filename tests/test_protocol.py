@@ -2,6 +2,10 @@ import math
 import struct
 from pathlib import Path
 import tomllib
+from types import SimpleNamespace
+
+import lightmeter.gui as gui
+import lightmeter.port_detect as port_detect
 
 import lightmeter.sensor as protocol
 
@@ -12,6 +16,43 @@ def assert_raises(exception_type, function):
     except exception_type:
         return
     raise AssertionError(f"expected {exception_type.__name__}")
+
+
+def stream_header():
+    return protocol.StreamHeader(
+        1,
+        1000,
+        2000,
+        protocol.StreamConfig(),
+        327.876,
+        (0, 132, 0, 0),
+        0,
+        0xFF,
+        0.4,
+        0.85,
+        0.05,
+        0,
+        0.0,
+        100_000,
+    )
+
+
+
+def stream_header_payload(*, format_=1, autogain=1, dark_source=0, dark_volts=0.0):
+    return b"".join(
+        (
+            struct.pack("<IQQ", 1, 1000, 2000),
+            struct.pack("<BBBBBHI", format_, 0, 1, 0, autogain, 1, 0),
+            struct.pack("<I", 327876),
+            struct.pack("<BBBB", 0, 132, 0, 0),
+            struct.pack("<H", 0),
+            struct.pack("<B", 0xFF),
+            struct.pack("<HHH", 13107, 27853, 1638),
+            struct.pack("<B", dark_source),
+            struct.pack("<f", dark_volts),
+            struct.pack("<I", 100_000),
+        )
+    )
 
 
 def test_cobs_round_trip_boundaries():
@@ -58,6 +99,28 @@ def test_encoded_frame_limit_applies_before_delimiter():
     assert_raises(protocol.ProtocolError, lambda: sensor._read_encoded(0.01))
 
 
+def test_device_id_and_usb_identity_validation():
+    assert port_detect._normalize_device_id("de657814573a0c29") == "DE657814573A0C29"
+    assert_raises(ValueError, lambda: port_detect._normalize_device_id("DE657814573A0C2"))
+    assert_raises(ValueError, lambda: port_detect._normalize_device_id("DE657814573A0C2Z"))
+    assert_raises(ValueError, lambda: protocol.LightSensor("unused", device_id="not-a-uid"))
+
+    expected = SimpleNamespace(
+        vid=0x2E8A,
+        pid=0xF00A,
+        product="LightSensor v3",
+        description="LightSensor v3",
+    )
+    wrong_vid = SimpleNamespace(
+        vid=0x1234,
+        pid=0x5678,
+        product="LightSensor v3",
+        description="LightSensor v3",
+    )
+    assert port_detect._is_lightsensor(expected)
+    assert not port_detect._is_lightsensor(wrong_vid)
+
+
 def test_terminal_device_error_clears_stream_state():
     sensor = protocol.LightSensor("unused")
     sensor.stream_header = object()
@@ -65,6 +128,12 @@ def test_terminal_device_error_clears_stream_state():
     sensor._read_message = lambda timeout: (protocol.MSG_ERROR, payload)
     assert_raises(protocol.DeviceError, lambda: sensor._wait_for(7, {protocol.MSG_OK}))
     assert sensor.stream_header is None
+
+
+def test_short_correlated_response_is_protocol_error():
+    sensor = protocol.LightSensor("unused")
+    sensor._read_message = lambda timeout: (protocol.MSG_OK, b"")
+    assert_raises(protocol.ProtocolError, lambda: sensor._wait_for(1, {protocol.MSG_OK}))
 
 
 def test_reconnect_failure_does_not_recurse():
@@ -146,9 +215,20 @@ def test_stream_config_contracts():
     assert_raises(ValueError, lambda: protocol.StreamConfig(output_count=1))
 
 
+
+def test_stream_config_rejects_wrong_field_types_and_bounds():
+    assert_raises(TypeError, lambda: protocol.StreamConfig(format=0))
+    assert_raises(TypeError, lambda: protocol.StreamConfig(mode=0))
+    assert_raises(ValueError, lambda: protocol.StreamConfig(profile_id=256))
+    assert_raises(ValueError, lambda: protocol.StreamConfig(gain_index=8))
+    assert_raises(TypeError, lambda: protocol.StreamConfig(autogain=1))
+    assert_raises(TypeError, lambda: protocol.StreamConfig(window=1.0))
+    assert_raises(TypeError, lambda: protocol.StreamConfig(output_count=1.0))
+
 def test_sample_payloads_preserve_metadata():
     sensor = protocol.LightSensor("unused")
     raw_payload = struct.pack("<IQBBif", 7, 123456, 3, 5, -1234, 29.5)
+
     raw = sensor._parse_sample(protocol.MSG_SAMPLE_RAW, raw_payload)
     assert raw.sequence == 7
     assert raw.device_timestamp_us == 123456
@@ -166,6 +246,92 @@ def test_sample_payloads_preserve_metadata():
     assert volts.status == protocol.SampleStatus.AUTOGAIN_UNDERRANGE
     assert math.isclose(volts.value, -0.00125, rel_tol=1e-6)
 
+
+def test_stream_header_payload_validates_wire_semantics():
+    sensor = protocol.LightSensor("unused")
+    header = sensor._parse_header(stream_header_payload())
+    assert header.config == protocol.StreamConfig()
+    assert math.isclose(header.measured_sps, 327.876)
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_header(stream_header_payload(format_=0, autogain=1)),
+    )
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_header(stream_header_payload(dark_source=2)),
+    )
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_header(stream_header_payload(dark_volts=math.inf)),
+    )
+
+
+
+
+def test_sample_payload_rejects_invalid_enum_bits_and_floats():
+    sensor = protocol.LightSensor("unused")
+    bad_gain = struct.pack("<IQBBff", 1, 2, 8, 0, 0.0, 25.0)
+    bad_status = struct.pack("<IQBBff", 1, 2, 0, 0x08, 0.0, 25.0)
+    bad_voltage = struct.pack("<IQBBff", 1, 2, 0, 0, math.inf, 25.0)
+    bad_temperature = struct.pack("<IQBBff", 1, 2, 0, 0, 0.0, math.nan)
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_sample(protocol.MSG_SAMPLE_VOLTS, bad_gain),
+    )
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_sample(protocol.MSG_SAMPLE_VOLTS, bad_status),
+    )
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_sample(protocol.MSG_SAMPLE_VOLTS, bad_voltage),
+    )
+    assert_raises(
+        protocol.ProtocolError,
+        lambda: sensor._parse_sample(protocol.MSG_SAMPLE_VOLTS, bad_temperature),
+    )
+
+
+def test_invalid_status_and_stop_enums_are_protocol_errors():
+    sensor = protocol.LightSensor("unused")
+    bad_status = struct.pack(
+        "<IBBBBfffQH",
+        1,
+        9,
+        1,
+        protocol.StorageState.EMPTY,
+        0,
+        0.0,
+        math.nan,
+        math.nan,
+        1,
+        0,
+    )
+    bad_stop = struct.pack("<IQIB", 0, 1, 0, 9)
+    assert_raises(protocol.ProtocolError, lambda: sensor._parse_status(bad_status))
+    assert_raises(protocol.ProtocolError, lambda: sensor._parse_stopped(bad_stop))
+
+
+def test_synchronize_time_clears_stale_stream_state():
+    sensor = protocol.LightSensor("unused")
+    sensor.stream_header = object()
+    sensor._events.append(object())
+    sent = {}
+
+    def write_request(message_type, request_id, payload):
+        sent["utc"] = struct.unpack("<Q", payload)[0]
+
+    def wait_for(request_id, accepted_types):
+        return (
+            protocol.MSG_TIME_SYNCED,
+            struct.pack("<IQQ", request_id, sent["utc"], 1234),
+        )
+
+    sensor._write_request = write_request
+    sensor._wait_for = wait_for
+    assert sensor.synchronize_time()[1] == 1234
+    assert sensor.stream_header is None
+    assert not sensor._events
 
 def test_status_nan_fields_become_none():
     sensor = protocol.LightSensor("unused")
@@ -203,6 +369,73 @@ def test_error_payload_maps_sequence_sentinel():
     assert event.stream_start_device_us == 1234
     assert event.last_sample_sequence is None
     assert event.message == "ADS1220 data-ready timeout"
+
+
+def test_gui_reconnect_remains_bound_to_first_device():
+    device_id = "DE657814573A0C29"
+    info = protocol.DeviceInfo(
+        (3, 0, 0),
+        3,
+        protocol.REQUIRED_CAPABILITIES,
+        protocol.MAX_DECODED_FRAME,
+        device_id,
+        True,
+        protocol.StorageState.EMPTY,
+    )
+    requested_ids = []
+    sampler = gui.SensorSampler()
+
+    class FakeSensor:
+        def __init__(self, port, *, timeout, device_id=None):
+            requested_ids.append(device_id)
+            self.profiles = ()
+
+        def connect(self):
+            if len(requested_ids) == 2:
+                sampler._running.clear()
+            return info
+
+        def start_stream(self, config):
+            return stream_header()
+
+        def read_event(self, timeout):
+            raise ConnectionError("disconnected")
+
+        def close(self):
+            pass
+
+    real_sensor = gui.LightSensor
+    gui.LightSensor = FakeSensor
+    sampler._running.set()
+    try:
+        sampler._run()
+    finally:
+        gui.LightSensor = real_sensor
+    assert requested_ids == [None, device_id]
+
+
+def test_recording_write_failure_disables_recording_without_raising():
+    class FailingWriter:
+        def writerow(self, row):
+            raise OSError("disk full")
+
+    class RecordingFile:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    sampler = gui.SensorSampler("unused")
+    sampler._recording = True
+    sampler._record_file = RecordingFile()
+    sampler._record_writer = FailingWriter()
+    sampler._header = stream_header()
+    sample = protocol.VoltageSample(0, 1000, 0, protocol.SampleStatus.NONE, 0.1, 25.0)
+    sampler._record_sample(sample)
+    snapshot = sampler.snapshot()
+    assert not snapshot.recording
+    assert snapshot.recording_path is None
+    assert "disk full" in snapshot.status
 
 
 if __name__ == "__main__":
