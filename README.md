@@ -27,6 +27,12 @@ temperature compensation are not implemented yet.
   CRC32, bounded frame size, and explicit stream start/stop/error events.
 - The GUI keeps serial ownership on one worker thread and writes one versioned
   CSV per recorded stream.
+- The GUI distinguishes configured start/manual gain from the actual per-sample
+  gain selected by firmware autogain.
+- The live plot uses canvas-width min/max bins across its 10-second window
+  without dropping acquisition or CSV samples. It updates at 20 Hz except in
+  turbo mode, which uses 10 Hz for USB headroom. Paused plots retain manual pan
+  and zoom limits and re-bin the selected history.
 
 ## Hardware
 

@@ -1,3 +1,4 @@
+from bisect import bisect_left, bisect_right
 import argparse
 import csv
 from collections import deque
@@ -28,9 +29,12 @@ from lightmeter.sensor import (
     VoltageSample,
 )
 
-REFRESH_MS = 50
+DEFAULT_REFRESH_MS = 50
+TURBO_REFRESH_MS = 100
+TURBO_PROFILE_ID = 2
 WINDOW_SECONDS = 10
 MAX_POINTS = 20_000
+CLIP_STATUS_MASK = 0x07
 RECORDINGS_DIR = Path(__file__).parent.parent / "recordings"
 CSV_COLUMNS = [
     "row_type",
@@ -57,6 +61,89 @@ CSV_COLUMNS = [
     "dark_source",
     "active_dark_volts",
 ]
+
+
+def _refresh_interval(snapshot):
+    if (
+        snapshot.acquiring
+        and snapshot.header is not None
+        and snapshot.header.config.profile_id == TURBO_PROFILE_ID
+    ):
+        return TURBO_REFRESH_MS
+    return DEFAULT_REFRESH_MS
+
+
+def _actual_gain_text(snapshot):
+    if snapshot.latest is not None:
+        return f"{snapshot.latest.gain}×"
+    if snapshot.header is not None:
+        return f"{snapshot.header.config.gain}×"
+    return "—"
+
+
+def _prepare_plot_points(times, values, statuses, left, right, bin_count):
+    if not (len(times) == len(values) == len(statuses)):
+        raise ValueError("plot arrays must have equal lengths")
+    if bin_count < 1:
+        raise ValueError("bin_count must be positive")
+    if right < left:
+        left, right = right, left
+
+    first = bisect_left(times, left)
+    stop = bisect_right(times, right)
+    point_count = stop - first
+    if point_count <= bin_count * 2:
+        return (
+            tuple(times[first:stop]),
+            tuple(values[first:stop]),
+            tuple(statuses[first:stop]),
+        )
+    if right == left:
+        return (), (), ()
+
+    buckets = [None] * bin_count
+    span = right - left
+    for index in range(first, stop):
+        bucket_index = min(int((times[index] - left) * bin_count / span), bin_count - 1)
+        bucket = buckets[bucket_index]
+        if bucket is None:
+            buckets[bucket_index] = [
+                index,
+                index,
+                index,
+                index,
+                statuses[index] & CLIP_STATUS_MASK,
+            ]
+            continue
+        bucket[1] = index
+        if values[index] < values[bucket[2]]:
+            bucket[2] = index
+        if values[index] > values[bucket[3]]:
+            bucket[3] = index
+        bucket[4] |= statuses[index] & CLIP_STATUS_MASK
+
+    plotted_times = []
+    plotted_values = []
+    plotted_statuses = []
+    for bucket in buckets:
+        if bucket is None:
+            continue
+        first_index, last_index, minimum, maximum, clipping = bucket
+        if minimum == maximum:
+            indices = [first_index]
+            if last_index != first_index:
+                indices.append(last_index)
+        else:
+            indices = sorted((minimum, maximum))
+        status_overrides = {}
+        if clipping and not any(statuses[index] & CLIP_STATUS_MASK for index in indices):
+            representative = max(indices, key=lambda index: abs(values[index]))
+            status_overrides[representative] = statuses[representative] | clipping
+        for index in indices:
+            plotted_times.append(times[index])
+            plotted_values.append(values[index])
+            plotted_statuses.append(status_overrides.get(index, statuses[index]))
+    return tuple(plotted_times), tuple(plotted_values), tuple(plotted_statuses)
 
 
 @dataclass(frozen=True)
@@ -630,7 +717,7 @@ class SensorApp:
         )
         self.profile_box.grid(row=1, column=0, padx=(0, 8))
 
-        ttk.Label(controls, text="Gain").grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(controls, text="Start/manual gain").grid(row=0, column=1, sticky=tk.W)
         self.gain_var = tk.StringVar(value="1×")
         self.gain_box = ttk.Combobox(
             controls,
@@ -651,11 +738,18 @@ class SensorApp:
         ttk.Spinbox(controls, from_=1, to=1024, textvariable=self.window_var, width=8).grid(
             row=1, column=3, padx=(0, 8)
         )
-        ttk.Button(controls, text="Apply", command=self._apply).grid(row=1, column=4, padx=3)
-        ttk.Button(controls, text="Pause", command=sampler.pause).grid(row=1, column=5, padx=3)
-        ttk.Button(controls, text="Resume", command=sampler.resume).grid(row=1, column=6, padx=3)
-        ttk.Button(controls, text="Clear plot", command=sampler.clear_plot).grid(
+        ttk.Label(controls, text="Actual gain").grid(row=0, column=4, sticky=tk.W)
+        self.actual_gain_var = tk.StringVar(value="—")
+        ttk.Label(controls, textvariable=self.actual_gain_var, width=8).grid(
+            row=1, column=4, padx=(0, 8), sticky=tk.W
+        )
+        ttk.Button(controls, text="Apply", command=self._apply).grid(row=1, column=5, padx=3)
+        ttk.Button(controls, text="Pause", command=sampler.pause).grid(row=1, column=6, padx=3)
+        ttk.Button(controls, text="Resume", command=sampler.resume).grid(
             row=1, column=7, padx=3
+        )
+        ttk.Button(controls, text="Clear plot", command=sampler.clear_plot).grid(
+            row=1, column=8, padx=3
         )
 
         zero_controls = ttk.Frame(root, padding=(8, 0, 8, 8))
@@ -714,7 +808,7 @@ class SensorApp:
         self.canvas = FigureCanvasTkAgg(figure, master=root)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         NavigationToolbar2Tk(self.canvas, root)
-        self._redraw_job = root.after(REFRESH_MS, self._redraw)
+        self._redraw_job = root.after(DEFAULT_REFRESH_MS, self._redraw)
 
     def _apply(self):
         try:
@@ -734,6 +828,8 @@ class SensorApp:
             messagebox.showerror("Invalid stream configuration", str(exc), parent=self.root)
             return
         self.sampler.apply(config)
+
+
 
     def _zero(self):
         try:
@@ -770,6 +866,46 @@ class SensorApp:
         except (OSError, ValueError, KeyError, csv.Error) as exc:
             messagebox.showerror("Recording", str(exc), parent=self.root)
 
+    def _update_plot(self, snapshot):
+        if not snapshot.times:
+            self.line.set_data([], [])
+            self.clipped_line.set_data([], [])
+            return
+
+        if snapshot.acquiring:
+            latest = snapshot.times[-1]
+            left = max(0.0, latest - WINDOW_SECONDS)
+            right = max(WINDOW_SECONDS, latest)
+        else:
+            left, right = self.axes.get_xlim()
+        bin_count = max(1, int(self.axes.bbox.width))
+        times, values, statuses = _prepare_plot_points(
+            snapshot.times,
+            snapshot.values,
+            snapshot.statuses,
+            left,
+            right,
+            bin_count,
+        )
+        self.line.set_data(times, values)
+        clip_pairs = [
+            (time_, value)
+            for time_, value, status in zip(times, values, statuses)
+            if status & CLIP_STATUS_MASK
+        ]
+        self.clipped_line.set_data(
+            [pair[0] for pair in clip_pairs],
+            [pair[1] for pair in clip_pairs],
+        )
+        if snapshot.acquiring:
+            self.axes.set_xlim(left, right)
+            if values:
+                low = min(values)
+                high = max(values)
+                margin = max((high - low) * 0.1, 1e-9)
+                self.axes.set_ylim(low - margin, high + margin)
+
+
     def _redraw(self):
         snapshot = self.sampler.snapshot()
         if snapshot.profiles != self._last_profiles and snapshot.profiles:
@@ -786,6 +922,7 @@ class SensorApp:
             self.banner.configure(bg="#665500")
 
         latest = snapshot.latest
+        self.actual_gain_var.set(_actual_gain_text(snapshot))
         if latest is None:
             latest_text = "No samples"
         else:
@@ -819,34 +956,9 @@ class SensorApp:
             text="Stop recording" if snapshot.recording else "Start recording"
         )
 
-        if snapshot.times:
-            self.line.set_data(snapshot.times, snapshot.values)
-            clip_pairs = [
-                (time_, value)
-                for time_, value, status in zip(
-                    snapshot.times, snapshot.values, snapshot.statuses
-                )
-                if status & 0x07
-            ]
-            self.clipped_line.set_data(
-                [pair[0] for pair in clip_pairs], [pair[1] for pair in clip_pairs]
-            )
-            right = snapshot.times[-1]
-            self.axes.set_xlim(max(0.0, right - WINDOW_SECONDS), max(WINDOW_SECONDS, right))
-            visible_values = [
-                value
-                for time_, value in zip(snapshot.times, snapshot.values)
-                if time_ >= right - WINDOW_SECONDS
-            ]
-            low = min(visible_values)
-            high = max(visible_values)
-            margin = max((high - low) * 0.1, 1e-9)
-            self.axes.set_ylim(low - margin, high + margin)
-        else:
-            self.line.set_data([], [])
-            self.clipped_line.set_data([], [])
+        self._update_plot(snapshot)
         self.canvas.draw_idle()
-        self._redraw_job = self.root.after(REFRESH_MS, self._redraw)
+        self._redraw_job = self.root.after(_refresh_interval(snapshot), self._redraw)
 
     def _on_close(self):
         self.root.after_cancel(self._redraw_job)

@@ -258,6 +258,18 @@ settings causes a complete stream replacement. CSV files use a fixed column
 schema with one `stream_start` metadata row followed by `sample` rows.
 If opening, writing, flushing, or closing a CSV fails, recording is disabled and
 the GUI reports the error while acquisition continues.
+The `Start/manual gain` control selects the configured starting or fixed gain.
+The separate `Actual gain` field follows the gain reported by each sample, including
+firmware autogain changes.
+The live graph divides the selected time range into roughly one bin per
+horizontal canvas pixel. It updates at 20 Hz for the filtered and interactive
+profiles, and at 10 Hz for turbo to preserve USB servicing headroom. It plots
+chronological minimum and maximum samples from each bin, preserving peaks and
+clipping while bounding rendering independently from acquisition rate. This is
+display-only; acquisition and CSV recording remain complete. Live acquisition
+owns a rolling 10-second x range and automatic y limits. Pausing returns to
+20 Hz, freezes those limits, and re-bins toolbar pan/zoom selections from raw
+history; sufficiently narrow ranges display every sample.
 
 ## Firmware build and recovery
 

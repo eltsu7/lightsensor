@@ -127,6 +127,10 @@ Hold `BOOT`, pulse `RESET`, then release `BOOT` for manual ROM UF2 recovery.
   prior stream or select another device.
 - `SensorSampler` is the GUI's sole serial owner. Queue controls onto its worker,
   treat stream replacements as new sessions, and protect every UI snapshot.
+- Bound live rendering independently from acquisition history and recording:
+  use canvas-width chronological min/max bins at 20 Hz, reduced to 10 Hz for
+  turbo acquisition. Paused plots must re-bin raw history without changing user
+  pan/zoom limits.
 - Record one CSV per stream. Include the full effective start/config row and UTC,
   device time, sequence, value, gain, status, and temperature for every sample.
 

@@ -414,6 +414,91 @@ def test_gui_reconnect_remains_bound_to_first_device():
     assert requested_ids == [None, device_id]
 
 
+def test_actual_gain_display_uses_sample_not_starting_gain():
+    header = SimpleNamespace(config=SimpleNamespace(gain=1))
+    no_stream = SimpleNamespace(latest=None, header=None)
+    starting = SimpleNamespace(latest=None, header=header)
+    autogained = SimpleNamespace(latest=SimpleNamespace(gain=128), header=header)
+
+    assert gui._actual_gain_text(no_stream) == "—"
+    assert gui._actual_gain_text(starting) == "1×"
+    assert gui._actual_gain_text(autogained) == "128×"
+
+
+def test_plot_refresh_slows_only_during_turbo_acquisition():
+    normal_header = SimpleNamespace(config=SimpleNamespace(profile_id=1))
+    turbo_header = SimpleNamespace(
+        config=SimpleNamespace(profile_id=gui.TURBO_PROFILE_ID)
+    )
+    normal = SimpleNamespace(acquiring=True, header=normal_header)
+    turbo = SimpleNamespace(acquiring=True, header=turbo_header)
+    paused = SimpleNamespace(acquiring=False, header=turbo_header)
+
+    assert gui._refresh_interval(normal) == gui.DEFAULT_REFRESH_MS
+    assert gui._refresh_interval(turbo) == gui.TURBO_REFRESH_MS
+    assert gui._refresh_interval(paused) == gui.DEFAULT_REFRESH_MS
+
+
+def test_plot_bins_span_window_and_preserve_extrema_and_clipping():
+    times = tuple(index / 1000.0 for index in range(20_000))
+    values = [0.0] * len(times)
+    statuses = [0] * len(times)
+    values[12_000] = 10.0
+    values[15_000] = -8.0
+    statuses[17_000] = int(protocol.SampleStatus.ADC_POSITIVE_CLIP)
+
+    plotted_times, plotted_values, plotted_statuses = gui._prepare_plot_points(
+        times,
+        values,
+        statuses,
+        10.0,
+        20.0,
+        500,
+    )
+
+    assert len(plotted_times) <= 1000
+    assert plotted_times[0] == 10.0
+    assert plotted_times[-1] == times[-1]
+    assert max(plotted_values) == 10.0
+    assert min(plotted_values) == -8.0
+    assert any(status & gui.CLIP_STATUS_MASK for status in plotted_statuses)
+
+    narrow = gui._prepare_plot_points(times, values, statuses, 12.0, 12.5, 500)
+    assert narrow[0] == times[12_000:12_501]
+    assert narrow[1] == tuple(values[12_000:12_501])
+    assert narrow[2] == tuple(statuses[12_000:12_501])
+
+
+def test_paused_plot_update_preserves_limits_and_rebins_selected_range():
+    figure = gui.Figure()
+    app = gui.SensorApp.__new__(gui.SensorApp)
+    app.axes = figure.add_subplot(111)
+    (app.line,) = app.axes.plot([], [])
+    (app.clipped_line,) = app.axes.plot([], [])
+    app.axes.set_xlim(12.0, 13.0)
+    app.axes.set_ylim(-2.0, 3.0)
+    snapshot = SimpleNamespace(
+        times=tuple(index / 1000.0 for index in range(20_000)),
+        values=tuple((index % 100) / 100.0 for index in range(20_000)),
+        statuses=(0,) * 20_000,
+        acquiring=False,
+    )
+
+    app._update_plot(snapshot)
+    assert app.axes.get_xlim() == (12.0, 13.0)
+    assert app.axes.get_ylim() == (-2.0, 3.0)
+    assert min(app.line.get_xdata()) >= 12.0
+    assert max(app.line.get_xdata()) <= 13.0
+
+    snapshot.acquiring = True
+    app._update_plot(snapshot)
+    assert app.axes.get_xlim() == (
+        snapshot.times[-1] - gui.WINDOW_SECONDS,
+        snapshot.times[-1],
+    )
+    assert app.axes.get_ylim() != (-2.0, 3.0)
+
+
 def test_recording_write_failure_disables_recording_without_raising():
     class FailingWriter:
         def writerow(self, row):
